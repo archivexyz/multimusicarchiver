@@ -3,6 +3,10 @@ scdl
 yt-dlp
 mutagen
 
-# Not on PyPI; installed from source. The app can also install this
-# itself via its "Install Bandcamp" button.
-bandcamp-downloader @ git+https://github.com/easlice/bandcamp-downloader.git
+# Dependencies of the vendored bandcamp-downloader
+# (source/vendor_bandcamp_downloader.py) -- it's bundled directly rather than
+# pip-installed, so its own deps are listed here instead.
+beautifulsoup4
+curl_cffi
+browser_cookie3
+tqdm

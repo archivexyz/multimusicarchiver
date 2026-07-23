@@ -109,17 +109,6 @@ def scdl_executable_names() -> tuple[str, ...]:
     return ("scdl.exe", "scdl.cmd", "scdl.bat", "scdl") if os.name == "nt" else ("scdl",)
 
 
-def bandcamp_executable_names() -> tuple[str, ...]:
-    if os.name == "nt":
-        return (
-            "bandcamp-downloader.exe",
-            "bandcamp-downloader.py",
-            "bandcamp-downloader.cmd",
-            "bandcamp-downloader.bat",
-        )
-    return ("bandcamp-downloader", "bandcamp-downloader.py")
-
-
 def candidate_scdl_paths() -> list[str]:
     dirs = [
         user_scripts_dir(),
@@ -160,38 +149,6 @@ def candidate_scdl_paths() -> list[str]:
     for directory in dirs:
         directory = os.path.expanduser(directory)
         for executable in scdl_executable_names():
-            path = os.path.join(directory, executable)
-            normalized = os.path.normcase(os.path.abspath(path))
-            if normalized not in seen:
-                seen.add(normalized)
-                candidates.append(path)
-    return candidates
-
-
-def candidate_bandcamp_paths() -> list[str]:
-    dirs = [
-        user_scripts_dir(),
-        os.path.join(sys.prefix, "Scripts"),
-        os.path.join(sys.base_prefix, "Scripts"),
-        os.path.dirname(sys.executable),
-    ]
-    if os.name == "nt":
-        home = os.path.expanduser("~")
-        appdata = os.environ.get("APPDATA", "")
-        localappdata = os.environ.get("LOCALAPPDATA", "")
-        if appdata:
-            dirs.append(os.path.join(appdata, "Python", "Scripts"))
-        if localappdata:
-            dirs.append(os.path.join(localappdata, "Programs", "Python", "Scripts"))
-        dirs.append(os.path.join(home, ".local", "bin"))
-    else:
-        dirs.extend(("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"))
-
-    candidates = []
-    seen = set()
-    for directory in dirs:
-        directory = os.path.expanduser(directory)
-        for executable in bandcamp_executable_names():
             path = os.path.join(directory, executable)
             normalized = os.path.normcase(os.path.abspath(path))
             if normalized not in seen:
@@ -301,44 +258,13 @@ def resolve_scdl_path(profile: dict | None = None) -> str | None:
     return None
 
 
-def resolve_bandcamp_path(profile: dict | None = None) -> str | None:
-    configured = ""
-    if profile:
-        configured = os.path.expanduser(str(profile.get("bandcamp_path", "")).strip())
-    else:
-        configured = os.path.expanduser(str(load_config().get("bandcamp_path", "")).strip())
-    if configured and os.path.exists(configured):
-        return configured
-
-    for executable in bandcamp_executable_names():
-        found = shutil.which(executable)
-        if found:
-            return found
-
-    for candidate in candidate_bandcamp_paths():
-        path = os.path.expanduser(candidate)
-        if os.path.isfile(path):
-            return path
-    return None
-
-
 def scdl_available() -> bool:
     return is_frozen_app() or resolve_scdl_path() is not None
-
-
-def bandcamp_available(profile: dict | None = None) -> bool:
-    return resolve_bandcamp_path(profile) is not None
 
 
 def save_scdl_path(path: str):
     config = load_config()
     config["scdl_path"] = path
-    save_config(config)
-
-
-def save_bandcamp_path(path: str):
-    config = load_config()
-    config["bandcamp_path"] = path
     save_config(config)
 
 
@@ -363,48 +289,12 @@ def scdl_latest_version(timeout: float = 6) -> str | None:
         return None
 
 
-def bandcamp_installed_commit() -> str | None:
-    try:
-        from importlib import metadata
-        direct_url_text = metadata.distribution("bandcamp-downloader").read_text("direct_url.json")
-        if not direct_url_text:
-            return None
-        data = json.loads(direct_url_text)
-        return (data.get("vcs_info") or {}).get("commit_id")
-    except Exception:
-        return None
-
-
-def bandcamp_latest_commit(timeout: float = 6) -> str | None:
-    try:
-        request = urllib.request.Request(
-            "https://api.github.com/repos/easlice/bandcamp-downloader/commits/HEAD",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "multimusicarchiver"},
-        )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        return data.get("sha")
-    except Exception:
-        return None
-
-
 def check_scdl_update() -> str | None:
     """Returns the latest scdl version if an update is available, else None."""
     installed = scdl_installed_version()
     if not installed:
         return None
     latest = scdl_latest_version()
-    if latest and latest != installed:
-        return latest
-    return None
-
-
-def check_bandcamp_update() -> str | None:
-    """Returns the latest bandcamp-downloader commit sha if an update is available, else None."""
-    installed = bandcamp_installed_commit()
-    if not installed:
-        return None
-    latest = bandcamp_latest_commit()
     if latest and latest != installed:
         return latest
     return None
@@ -1004,43 +894,6 @@ def build_scdl_cmd(profile: dict) -> list[str]:
 
 BANDCAMP_MAX_NAME_PART_LEN = 80
 
-BANDCAMP_LAUNCHER_HELPER = r'''
-import importlib.util
-import sys
-
-script_path = sys.argv[1]
-sys.argv = [script_path] + sys.argv[2:]
-
-spec = importlib.util.spec_from_file_location("bandcamp_downloader_wrapped", script_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-MAX_NAME_PART_LEN = __MAX_NAME_PART_LEN__
-UNSAFE_PATH_SEGMENTS = {"", ".", ".."}
-
-_original_sanitize_value = module.sanitize_value
-
-
-def _safe_sanitize_value(value):
-    value = _original_sanitize_value(value)
-    if isinstance(value, str):
-        # An artist/title of "" (blank), "." or ".." is a legal Bandcamp
-        # display name but a dangerous path segment: since it's used
-        # standalone as the artist folder in our --filename-format, ".."
-        # makes the tool write the file into the *parent* of the download
-        # directory instead of inside it.
-        if value in UNSAFE_PATH_SEGMENTS:
-            value = "Unsorted"
-        elif len(value) > MAX_NAME_PART_LEN:
-            value = value[:MAX_NAME_PART_LEN].rstrip()
-    return value
-
-
-module.sanitize_value = _safe_sanitize_value
-
-sys.exit(module.main())
-'''.replace("__MAX_NAME_PART_LEN__", str(BANDCAMP_MAX_NAME_PART_LEN))
-
 
 def build_bandcamp_cmd(profile: dict) -> list[str]:
     username = profile.get("bandcamp_username", "").strip()
@@ -1054,20 +907,13 @@ def build_bandcamp_cmd(profile: dict) -> list[str]:
     if not os.path.isfile(cookies):
         raise ValueError("Bandcamp cookies file does not exist")
 
-    bandcamp = resolve_bandcamp_path(profile)
-    if not bandcamp:
-        raise FileNotFoundError("bandcamp-downloader was not found. Install it before downloading.")
-
-    if os.path.splitext(bandcamp)[1].lower() == ".py":
-        # Bandcamp's own site truncates absurdly long album titles when
-        # naming its download file; bandcamp-downloader doesn't, and hands
-        # the untruncated title straight to open(), which crashes with
-        # OSError [Errno 22] once the resulting path is too long for
-        # Windows. Route through a small wrapper that patches the same
-        # truncation in ourselves.
-        cmd = [sys.executable, "-c", BANDCAMP_LAUNCHER_HELPER, bandcamp]
+    # bandcamp-downloader is vendored into this app (source/vendor_bandcamp_downloader.py)
+    # rather than resolved as a separately installed tool, so it's always run by
+    # re-invoking this same program (or the frozen executable) with --run-bandcamp.
+    if is_frozen_app():
+        cmd = [sys.executable, "--run-bandcamp"]
     else:
-        cmd = [bandcamp]
+        cmd = [sys.executable, os.path.abspath(__file__), "--run-bandcamp"]
 
     path = profile.get("bandcamp_path_to", "").strip()
     if path:
@@ -1932,7 +1778,6 @@ def schedule_profile(profile: dict) -> dict:
             "bandcamp_summary",
             "bandcamp_dry_run",
             "bandcamp_verbose",
-            "bandcamp_path",
         )
         return {key: profile.get(key) for key in keys if key in profile}
 
@@ -1957,9 +1802,7 @@ def schedule_profile(profile: dict) -> dict:
 
 def build_scheduled_command(profile: dict, sid: str | None = None) -> list[str]:
     profile = schedule_profile(profile)
-    if profile.get("service") == "bandcamp":
-        profile["bandcamp_path"] = resolve_bandcamp_path(profile) or ""
-    else:
+    if profile.get("service") != "bandcamp":
         profile["scdl_path"] = resolve_scdl_path(profile) or ""
     if sid:
         os.makedirs(SCHEDULE_DIR, exist_ok=True)
@@ -2310,9 +2153,7 @@ class ScdlApp(ctk.CTk):
         self._undo_stack: list[tuple[ctk.CTkEntry, str, str]] = []
         self._config = load_config()
         self._scdl_installer_running = False
-        self._bandcamp_installer_running = False
         self._scdl_update_available: str | None = None
-        self._bandcamp_update_available: str | None = None
         self._scdl_controls = []
         self._bandcamp_controls = []
 
@@ -2373,12 +2214,6 @@ class ScdlApp(ctk.CTk):
             width=110,
             command=self._install_scdl,
         )
-        self.install_bandcamp_btn = ctk.CTkButton(
-            header,
-            text="Install Bandcamp",
-            width=140,
-            command=self._install_bandcamp,
-        )
         self.update_scdl_btn = ctk.CTkButton(
             header,
             text="Update scdl",
@@ -2386,14 +2221,6 @@ class ScdlApp(ctk.CTk):
             fg_color=("#a06a00", "#8a5a00"),
             hover_color=("#8a5a00", "#734a00"),
             command=self._install_scdl,
-        )
-        self.update_bandcamp_btn = ctk.CTkButton(
-            header,
-            text="Update Bandcamp",
-            width=140,
-            fg_color=("#a06a00", "#8a5a00"),
-            hover_color=("#8a5a00", "#734a00"),
-            command=self._install_bandcamp,
         )
 
         # ── URL + Path row ──
@@ -2880,12 +2707,8 @@ class ScdlApp(ctk.CTk):
         self.bandcamp_nav_btn.configure(fg_color=("gray75", "gray25") if is_bandcamp else "transparent")
         if self.install_scdl_btn.winfo_ismapped():
             self.install_scdl_btn.pack_forget()
-        if self.install_bandcamp_btn.winfo_ismapped():
-            self.install_bandcamp_btn.pack_forget()
         if self.update_scdl_btn.winfo_ismapped():
             self.update_scdl_btn.pack_forget()
-        if self.update_bandcamp_btn.winfo_ismapped():
-            self.update_bandcamp_btn.pack_forget()
         if is_bandcamp:
             self.view_switch.grid_remove()
             self.archive_scan_btn.grid_remove()
@@ -2905,35 +2728,15 @@ class ScdlApp(ctk.CTk):
         if self.active_service.get() == "bandcamp":
             if self.update_scdl_btn.winfo_ismapped():
                 self.update_scdl_btn.pack_forget()
-            installed = bandcamp_available()
-            if installed:
-                if self.install_bandcamp_btn.winfo_ismapped():
-                    self.install_bandcamp_btn.pack_forget()
-                for widget in self._bandcamp_controls:
-                    widget.configure(state="normal")
-                self._toggle_bandcamp_schedule()
-                self._toggle_bandcamp_archive()
-                if not self._process or self._process.poll() is not None:
-                    self.stop_btn.configure(state="disabled")
-                self._set_status("Ready")
-                self._refresh_update_button(
-                    self.update_bandcamp_btn, "Update Bandcamp", self._bandcamp_update_available
-                )
-                return
-
-            if self.update_bandcamp_btn.winfo_ismapped():
-                self.update_bandcamp_btn.pack_forget()
-            if not self.install_bandcamp_btn.winfo_ismapped():
-                self.install_bandcamp_btn.pack(side="left", padx=(0, 18), pady=8)
-            self.install_bandcamp_btn.configure(state="disabled" if self._bandcamp_installer_running else "normal")
             for widget in self._bandcamp_controls:
-                widget.configure(state="disabled")
-            self.stop_btn.configure(state="disabled")
-            self._set_status("bandcamp-downloader is not installed")
+                widget.configure(state="normal")
+            self._toggle_bandcamp_schedule()
+            self._toggle_bandcamp_archive()
+            if not self._process or self._process.poll() is not None:
+                self.stop_btn.configure(state="disabled")
+            self._set_status("Ready")
             return
 
-        if self.update_bandcamp_btn.winfo_ismapped():
-            self.update_bandcamp_btn.pack_forget()
         installed = scdl_available()
         if installed:
             if self.install_scdl_btn.winfo_ismapped():
@@ -2963,7 +2766,7 @@ class ScdlApp(ctk.CTk):
             button.configure(text=f"{label} ({version})")
             if not button.winfo_ismapped():
                 button.pack(side="left", padx=(0, 18), pady=8)
-            if not (self._scdl_installer_running or self._bandcamp_installer_running):
+            if not self._scdl_installer_running:
                 button.configure(state="normal")
         elif button.winfo_ismapped():
             button.pack_forget()
@@ -2971,18 +2774,14 @@ class ScdlApp(ctk.CTk):
     def _check_for_updates(self):
         def run():
             scdl_update = None if is_frozen_app() else check_scdl_update()
-            bandcamp_update = check_bandcamp_update()
-            self.after(0, lambda: self._on_update_check_done(scdl_update, bandcamp_update))
+            self.after(0, lambda: self._on_update_check_done(scdl_update))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _on_update_check_done(self, scdl_update: str | None, bandcamp_update: str | None):
+    def _on_update_check_done(self, scdl_update: str | None):
         self._scdl_update_available = scdl_update
-        self._bandcamp_update_available = bandcamp_update[:7] if bandcamp_update else None
         if scdl_update:
             self._log(f"An scdl update is available: v{scdl_update}\n", "warn")
-        if bandcamp_update:
-            self._log(f"A bandcamp-downloader update is available (commit {bandcamp_update[:7]}).\n", "warn")
         self._refresh_scdl_state()
 
     def _install_scdl(self):
@@ -3051,76 +2850,6 @@ class ScdlApp(ctk.CTk):
         else:
             self._log(f"scdl install failed: {detail}\n", "error")
             messagebox.showerror("Install scdl", f"scdl could not be installed:\n{detail}")
-        self._refresh_scdl_state()
-
-    def _install_bandcamp(self):
-        if self._bandcamp_installer_running:
-            return
-
-        self._bandcamp_installer_running = True
-        self.install_bandcamp_btn.configure(state="disabled", text="Installing...")
-        if self.update_bandcamp_btn.winfo_ismapped():
-            self.update_bandcamp_btn.configure(state="disabled")
-        self._refresh_scdl_state()
-        self._log("\nInstalling bandcamp-downloader with pip from GitHub...\n")
-
-        def run():
-            scripts_dir = user_scripts_dir()
-            try:
-                os.makedirs(scripts_dir, exist_ok=True)
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--user",
-                    "--upgrade",
-                    "git+https://github.com/easlice/bandcamp-downloader.git",
-                ]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=child_process_env(),
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    self.after(0, lambda l=line: self._log(l))
-                proc.wait()
-
-                if proc.returncode != 0:
-                    self.after(0, lambda rc=proc.returncode: self._on_bandcamp_install_done(False, f"pip exited with code {rc}"))
-                    return
-
-                add_directory_to_user_path(scripts_dir)
-                found = resolve_bandcamp_path()
-                if not found:
-                    self.after(0, lambda: self._on_bandcamp_install_done(False, "pip finished, but bandcamp-downloader was not found"))
-                    return
-
-                self.after(0, lambda path=found: self._on_bandcamp_install_done(True, path))
-            except Exception as err:
-                self.after(0, lambda e=err: self._on_bandcamp_install_done(False, str(e)))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _on_bandcamp_install_done(self, ok: bool, detail: str):
-        self._bandcamp_installer_running = False
-        self.install_bandcamp_btn.configure(state="normal", text="Install Bandcamp")
-        if ok:
-            save_bandcamp_path(detail)
-            if self.install_bandcamp_btn.winfo_exists():
-                self.install_bandcamp_btn.pack_forget()
-            self._bandcamp_update_available = None
-            self._log(f"bandcamp-downloader installed: {detail}\n", "ok")
-            self._log(f"Added to PATH for this app and your user account: {user_scripts_dir()}\n", "ok")
-        else:
-            self._log(f"bandcamp-downloader install failed: {detail}\n", "error")
-            messagebox.showerror("Install Bandcamp", f"bandcamp-downloader could not be installed:\n{detail}")
         self._refresh_scdl_state()
 
     def _toggle_token(self):
@@ -3654,7 +3383,6 @@ class ScdlApp(ctk.CTk):
             "bandcamp_enable_schedule": self.bandcamp_enable_schedule.get(),
             "bandcamp_schedule_hour": self.bandcamp_schedule_hour.get(),
             "bandcamp_schedule_min": self.bandcamp_schedule_min.get(),
-            "bandcamp_path": resolve_bandcamp_path() or "",
         }
 
     def _filter_archived_originals(
@@ -3868,10 +3596,6 @@ class ScdlApp(ctk.CTk):
 
     # ── Download ──────────────────────────────────────────────────────────────
     def _start_download(self):
-        if self.active_service.get() == "bandcamp" and not bandcamp_available():
-            messagebox.showerror("Bandcamp not installed", "Install bandcamp-downloader before downloading.")
-            self._refresh_scdl_state()
-            return
         if self.active_service.get() != "bandcamp" and not scdl_available():
             messagebox.showerror("scdl not installed", "Install scdl before downloading.")
             self._refresh_scdl_state()
@@ -4054,9 +3778,7 @@ class ScdlApp(ctk.CTk):
 
     def _on_done(self, returncode: int):
         self.stop_btn.configure(state="disabled")
-        if (self.active_service.get() == "bandcamp" and bandcamp_available()) or (
-            self.active_service.get() != "bandcamp" and scdl_available()
-        ):
+        if self.active_service.get() == "bandcamp" or scdl_available():
             self.dl_btn.configure(state="normal")
         if returncode == 0:
             self._set_status(f"Done  ✓  {datetime.now().strftime('%H:%M:%S')}")
@@ -4071,10 +3793,6 @@ class ScdlApp(ctk.CTk):
 
     # ── Schedule registration ─────────────────────────────────────────────────
     def _register_schedule(self):
-        if self.active_service.get() == "bandcamp" and not bandcamp_available():
-            messagebox.showerror("Bandcamp not installed", "Install bandcamp-downloader before registering a schedule.")
-            self._refresh_scdl_state()
-            return
         if self.active_service.get() != "bandcamp" and not scdl_available():
             messagebox.showerror("scdl not installed", "Install scdl before registering a schedule.")
             self._refresh_scdl_state()
@@ -4216,6 +3934,39 @@ def run_embedded_scdl(args: list[str]) -> int:
         sys.argv = old_argv
 
 
+def run_embedded_bandcamp(args: list[str]) -> int:
+    import vendor_bandcamp_downloader as bandcamp_downloader
+
+    unsafe_path_segments = {"", ".", ".."}
+    original_sanitize_value = bandcamp_downloader.sanitize_value
+
+    def safe_sanitize_value(value):
+        value = original_sanitize_value(value)
+        if isinstance(value, str):
+            # An artist/title of "" (blank), "." or ".." is a legal Bandcamp
+            # display name but a dangerous path segment: since it's used
+            # standalone as the artist folder in our --filename-format, ".."
+            # makes the tool write the file into the *parent* of the download
+            # directory instead of inside it.
+            if value in unsafe_path_segments:
+                value = "Unsorted"
+            elif len(value) > BANDCAMP_MAX_NAME_PART_LEN:
+                value = value[:BANDCAMP_MAX_NAME_PART_LEN].rstrip()
+        return value
+
+    bandcamp_downloader.sanitize_value = safe_sanitize_value
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = ["bandcamp-downloader", *args]
+        result = bandcamp_downloader.main()
+        return int(result or 0)
+    except SystemExit as err:
+        return int(err.code or 0) if isinstance(err.code, int) else 1
+    finally:
+        sys.argv = old_argv
+
+
 def run_inline_helper(source: str, args: list[str]) -> int:
     old_argv = sys.argv[:]
     namespace = {"__name__": "__main__"}
@@ -4233,6 +3984,9 @@ if __name__ == "__main__":
     if "--run-scdl" in sys.argv:
         index = sys.argv.index("--run-scdl")
         raise SystemExit(run_embedded_scdl(sys.argv[index + 1:]))
+    if "--run-bandcamp" in sys.argv:
+        index = sys.argv.index("--run-bandcamp")
+        raise SystemExit(run_embedded_bandcamp(sys.argv[index + 1:]))
     if "--mp3-tag-helper" in sys.argv:
         index = sys.argv.index("--mp3-tag-helper")
         raise SystemExit(run_inline_helper(MP3_TAG_HELPER, sys.argv[index + 1:]))

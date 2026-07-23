@@ -4,6 +4,11 @@ A GUI that wraps [scdl](https://github.com/scdl-org/scdl) (SoundCloud) and
 [bandcamp-downloader](https://github.com/easlice/bandcamp-downloader) (Bandcamp) for archiving your
 library from either service, with optional daily scheduling and deleted track checking.
 
+bandcamp-downloader is vendored directly into this app (`source/vendor_bandcamp_downloader.py`,
+MIT licensed) rather than installed separately, so it's always available -- including in the
+frozen Mac/Windows/Linux builds. scdl remains a normal pip dependency with its own
+install/update button in the GUI.
+
 ## Requirements
 
 ```bash
@@ -99,5 +104,27 @@ as `cookie.txt`. These are only your cookies for bandcamp.com.
 Available for both services. Registers an OS-level daily task (macOS: LaunchAgents, Windows: Task
 Scheduler, Linux: cron) that reruns the configured profile at a fixed time, independent of the GUI
 being open.
+
+## Building frozen releases
+
+Frozen builds bundle scdl, yt-dlp, mutagen, and the vendored bandcamp-downloader directly, so end
+users don't need Python or `pip install` at all.
+
+```bash
+pip install -r requirements.txt -r packaging/requirements-build.txt
+python packaging/build.py
+```
+
+This produces `dist/MultiMusicArchiver.app` on macOS, or a `dist/MultiMusicArchiver/` folder
+(containing `MultiMusicArchiver`/`MultiMusicArchiver.exe`) on Linux/Windows. PyInstaller can't
+cross-compile, so each platform's build has to actually run on that platform.
+
+[.github/workflows/build.yml](.github/workflows/build.yml) builds all three platforms on GitHub's
+own runners: push a `v*` tag to build and attach zipped builds to a GitHub Release, or trigger it
+manually (Actions tab → Build frozen releases → Run workflow) to just produce downloadable
+artifacts without releasing.
+
+Builds are unsigned -- macOS will require right-click → Open the first launch (Gatekeeper), and
+Windows will show a SmartScreen warning to click through.
 
 
