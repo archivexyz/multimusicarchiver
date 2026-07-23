@@ -1,5 +1,6 @@
 """
-scdl GUI — CustomTkinter wrapper for https://github.com/scdl-org/scdl
+Multi Music Archiver — CustomTkinter GUI wrapping scdl (https://github.com/scdl-org/scdl)
+and bandcamp-downloader (https://github.com/easlice/bandcamp-downloader).
 Requirements: pip install customtkinter scdl
 """
 
@@ -34,10 +35,27 @@ if platform.system() == "Windows":
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "scdl_gui", "settings.json")
+LEGACY_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "scdl_gui")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "multimusicarchiver", "settings.json")
 CONFIG_DIR = os.path.dirname(CONFIG_PATH)
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
 SCHEDULE_DIR = os.path.join(CONFIG_DIR, "schedules")
+
+
+def migrate_legacy_config_dir():
+    """One-time move of settings/schedules/logs from the old ~/.config/scdl_gui
+    directory (pre-rename) into the new ~/.config/multimusicarchiver location.
+    Registered OS-level daily schedules (Task Scheduler/launchd/cron) still
+    point at the old script path and need to be re-registered separately --
+    this only carries over saved settings and schedule profile files."""
+    if os.path.isdir(LEGACY_CONFIG_DIR) and not os.path.exists(CONFIG_DIR):
+        try:
+            shutil.move(LEGACY_CONFIG_DIR, CONFIG_DIR)
+        except OSError:
+            pass
+
+
+migrate_legacy_config_dir()
 NAME_FORMAT = "[%(id)s] %(uploader)s - %(title)s.%(ext)s"
 PLAYLIST_NAME_FORMAT = "%(playlist_index)s. [%(id)s] %(uploader)s - %(title)s.%(ext)s"
 BANDCAMP_FORMATS = ("mp3-320", "flac", "wav", "aiff-lossless", "alac", "aac-hi", "mp3-v0", "vorbis")
@@ -1967,9 +1985,9 @@ def schedule_id(profile: dict, hour: int, minute: int) -> str:
     return digest[:12]
 
 
-def register_schedule_macos(hour: int, minute: int, cmd: list[str], sid: str):
+def register_schedule_macos(hour: int, minute: int, cmd: list[str], sid: str, prefix: str):
     """Write a launchd plist to ~/Library/LaunchAgents/"""
-    label = f"com.scdlgui.dailysync.{sid}"
+    label = f"com.{prefix}.dailysync.{sid}"
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1998,9 +2016,9 @@ def register_schedule_macos(hour: int, minute: int, cmd: list[str], sid: str):
     return plist_path
 
 
-def register_schedule_windows(hour: int, minute: int, cmd: list[str], sid: str):
+def register_schedule_windows(hour: int, minute: int, cmd: list[str], sid: str, prefix: str):
     """Use schtasks to register a daily task."""
-    task_name = f"scdl_gui_daily_sync_{sid}"
+    task_name = f"{prefix}_daily_sync_{sid}"
     time_str = f"{hour:02d}:{minute:02d}"
     result = subprocess.run([
         "schtasks", "/create", "/f",
@@ -2015,10 +2033,10 @@ def register_schedule_windows(hour: int, minute: int, cmd: list[str], sid: str):
     return task_name
 
 
-def register_schedule_linux(hour: int, minute: int, cmd: list[str], sid: str):
+def register_schedule_linux(hour: int, minute: int, cmd: list[str], sid: str, prefix: str):
     """Add/replace a cron entry."""
-    start_marker = f"# scdl_gui_sync {sid} start"
-    end_marker = f"# scdl_gui_sync {sid} end"
+    start_marker = f"# {prefix}_sync {sid} start"
+    end_marker = f"# {prefix}_sync {sid} end"
     cron_line = f"{minute} {hour} * * * {shell_join(cmd)}\n"
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     no_crontab = result.returncode != 0 and "no crontab for" in (result.stderr or "").lower()
@@ -3152,6 +3170,7 @@ class ScdlApp(ctk.CTk):
             fg_color=("gray95", "gray20"),
             text_color=("gray10", "gray95"),
             corner_radius=6,
+            font=ctk.CTkFont(size=12),
         )
         label.pack(ipadx=10, ipady=7)
         tooltip.bind("<Enter>", self._show_auth_tooltip)
@@ -3991,16 +4010,17 @@ class ScdlApp(ctk.CTk):
             self._save_current_values(profile)
             sid = schedule_id(profile, hour, minute)
             scheduled_cmd = build_scheduled_command(profile, sid)
+            prefix = "bandcampdl" if profile.get("service") == "bandcamp" else "scdl"
             system = platform.system()
 
             if system == "Darwin":
-                loc = register_schedule_macos(hour, minute, scheduled_cmd, sid)
+                loc = register_schedule_macos(hour, minute, scheduled_cmd, sid, prefix)
                 msg = f"Registered launchd agent:\n{loc}"
             elif system == "Windows":
-                loc = register_schedule_windows(hour, minute, scheduled_cmd, sid)
+                loc = register_schedule_windows(hour, minute, scheduled_cmd, sid, prefix)
                 msg = f"Registered Windows Task Scheduler task:\n{loc}"
             else:
-                loc = register_schedule_linux(hour, minute, scheduled_cmd, sid)
+                loc = register_schedule_linux(hour, minute, scheduled_cmd, sid, prefix)
                 msg = f"Registered cron job:\n{loc}"
 
             messagebox.showinfo("Schedule registered", msg)
