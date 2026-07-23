@@ -136,8 +136,8 @@ being open.
 
 ## Modification Rules
 
-Every scenario below is something the app can do to a file inside your "Save to" folder, and why it
-has to. Paths are shown relative to that folder; `<id>` is a real SoundCloud/Bandcamp ID.
+Every scenario below is something the app can do to a file inside your "Save to" folder. Paths are
+shown relative to that folder; `<id>` is a real SoundCloud/Bandcamp ID.
 
 ### What must be true before any file is touched
 
@@ -156,73 +156,65 @@ A file is only ever eligible if **all** of these hold:
 
 ### SoundCloud
 
-**Tags written and the `[id]` removed from the filename**
-```[318947562] Four Tet - Angel Echoes.mp3   →   Four Tet - Angel Echoes.mp3``` (only if 318947562 is in the selected archive.txt)
-*Why:* the SoundCloud track ID is written into the file's metadata so the **Archive Check** feature
-can match your local files back to SoundCloud and tell you which tracks have since been deleted or
-made private. Storing the ID in the tag rather than the filename means it survives renames and you
-still get clean filenames. The archive preflight also uses these tags to see which archived tracks
-you no longer have locally, so it can re-download only those instead of everything. This runs after
-each download, and also *before* a download when an archive is configured, to finish tagging files
-left behind by a previous run that was interrupted.
-
-If the clean name is already taken, the new file becomes `Four Tet - Angel Echoes (1).mp3` — an
-existing file is never overwritten.
+**Strips the SoundCloud ID from the filename and writes it into the file's tags**
+```
+[318947562] Four Tet - Angel Echoes.mp3   →   Four Tet - Angel Echoes.mp3
+```
+Happens when `318947562` is in the selected archive.txt (or, with no archive, only for files the
+current download just created). Runs after every download, and also before one starts to catch up
+on files left behind by a previous interrupted run. If the clean name is taken, becomes
+`Four Tet - Angel Echoes (1).mp3` instead of overwriting.
 
 ### Bandcamp
 
-**Album zip extracted, then the zip deleted** (only with "Extract" enabled)
+**Extracts a zip, then deletes it**
 ```
 Artist/[1234567] Artist - Album.zip   →   Artist/Artist - Album/…
 ```
-*Why:* extraction is the point of the option, and the zip is removed afterwards because its contents
-now exist on disk — keeping both would roughly double the disk usage of an entire library. Extracted
-files never overwrite anything: a name collision becomes `Track (1).mp3`.
+Happens with "Extract" enabled, whenever the album's extracted folder doesn't already contain
+audio — i.e. the first time this zip is extracted (new album, or an archived album whose extracted
+files went missing and are being restored). Collisions inside the extracted folder become
+`Track (1).mp3` rather than overwriting.
 
-**Single track filed into `Singles/` and renamed**
+**Files a single track into `Singles/` and renames it**
 ```
 Artist/[1234567] Artist - Track.mp3   →   Artist/Singles/Artist - Track.mp3
 ```
-*Why:* Bandcamp delivers single tracks as bare audio files rather than zips, so without this they'd
-sit loose in the artist folder alongside album folders. This gives singles the same clean, ID-free
-naming that extracted albums get. Collisions become `Artist - Track (1).mp3`.
+Happens with "Extract" enabled, for a bare-audio single (Bandcamp doesn't zip singles). Collisions
+become `Artist - Track (1).mp3`.
 
-**Leftover `.part` staging file deleted**
+**Deletes a leftover `.part` staging file**
 ```
 Artist/[1234567] Artist - Album.zip.part
 ```
-*Why:* downloads stream to a `.part` file and are only moved into place after passing a size and
-zip-structure check, so a stopped or interrupted download can never leave a truncated file at the
-real path. The `.part` left behind by that stopped attempt is dead weight and gets cleaned up on the
-next run.
+Happens on the run after a download was interrupted mid-transfer — `.part` files are never the final
+output, so a stale one left over is cleaned up.
 
-**An earlier incomplete download replaced**
+**Replaces an existing zip's content**
 ```
 Artist/[1234567] Artist - Album.zip   (content replaced)
 ```
-*Why:* Bandcamp reports each album's expected size. If the file already on disk doesn't match, it is
-assumed to be a damaged or partial earlier download (or the album was re-uploaded) and is fetched
-again. The replacement only happens after the new copy passes validation. **This is the one case
-where a file's content is genuinely overwritten** — so a different file that happens to share the
-exact name, layout, and ID would be replaced. With **Extract enabled this never occurs**, since a
-successfully extracted zip is deleted right after extraction, leaving no file at that path to
-compare sizes against.
+Happens when a file already sits at that exact path but its size doesn't match what Bandcamp
+reports for the album — treated as a damaged/partial earlier download and re-fetched. **This is the
+one case where a file's content is genuinely overwritten.** With "Extract" enabled this never
+happens, since a successfully extracted zip is deleted right after extraction, leaving nothing at
+that path to compare.
 
-**Redundant re-download deleted**
+**Deletes a redundant re-download without opening it**
 ```
 Artist/[1234567] Artist - Album.zip   (deleted)
 ```
-*Why:* Bandcamp orders your collection by most recently *acquired*, not released — buying a
-discography bundle re-surfaces albums you already own. Without this, every sync would re-download
-and re-extract albums you already have. The file is only deleted once the extracted folder (or
-enough sorted singles) is confirmed to actually exist on disk with real audio in it; if that output
-is missing, the fresh download is kept instead so the loss self-heals.
+Happens when the album is already archived **and** its extracted folder already has real audio on
+disk from a previous run — Bandcamp resurfaces already-owned albums when a discography bundle is
+purchased, re-triggering a download of something you already have. Deleted on sight, without
+extracting or validating it. (If the extracted output is missing instead, the "extracts, then
+deletes" case above runs so the album self-heals rather than being dropped.)
 
-**Corrupt zip quarantined — renamed, not deleted**
+**Quarantines a corrupt zip by renaming it**
 ```
 Artist/[1234567] Artist - Album.zip   →   Artist/[1234567] Artist - Album.zip.corrupt
 ```
-*Why:* a structurally broken zip can't be extracted, and renaming it off `.zip` makes the next sync
-fetch a fresh copy. It is renamed rather than deleted so the bytes remain recoverable if the
-corruption verdict was ever wrong. Zips that can't be judged at all (encrypted members, unsupported
-compression) are left completely untouched rather than assumed broken.
+Happens when a zip owned by this app fails structural validation. Renamed rather than deleted so the
+bytes stay recoverable if the corruption verdict was ever wrong; the next sync fetches a fresh copy.
+A zip that can't be judged at all (encrypted, unsupported compression) is left untouched rather than
+assumed corrupt.
