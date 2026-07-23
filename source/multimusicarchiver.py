@@ -58,6 +58,11 @@ BANDCAMP_COOKIES_HELP_SUFFIX = (
     " These are only your cookies for bandcamp.com."
 )
 
+ARCHIVE_SYNC_HELP_TEXT = (
+    "Keeps track of songs / albums already downloaded and prevents them from being written again. "
+    "Highly recommended if you plan to do scheduled runs."
+)
+
 
 def is_frozen_app() -> bool:
     return bool(getattr(sys, "frozen", False))
@@ -3406,8 +3411,12 @@ class ScdlApp(ctk.CTk):
         sep2 = ctk.CTkFrame(opts, height=1, fg_color=("gray80", "gray30"))
         sep2.grid(row=7, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
 
-        ctk.CTkLabel(opts, text="Archive / sync", font=ctk.CTkFont(weight="bold")).grid(
-            row=8, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
+        archive_sync_header = ctk.CTkFrame(opts, fg_color="transparent")
+        archive_sync_header.grid(row=8, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
+        ctk.CTkLabel(archive_sync_header, text="Archive / sync", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        archive_sync_help = self._make_help_bubble(archive_sync_header)
+        archive_sync_help.pack(side="left", padx=(6, 0))
+        self._bind_static_tooltip(archive_sync_help, ARCHIVE_SYNC_HELP_TEXT)
 
         self.use_archive = ctk.BooleanVar(value=True)
         self.skip_existing = ctk.BooleanVar(value=True)
@@ -3523,8 +3532,12 @@ class ScdlApp(ctk.CTk):
         sep_bc_archive = ctk.CTkFrame(bandcamp_opts, height=1, fg_color=("gray80", "gray30"))
         sep_bc_archive.grid(row=8, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
 
-        ctk.CTkLabel(bandcamp_opts, text="Archive / sync", font=ctk.CTkFont(weight="bold")).grid(
-            row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
+        bandcamp_archive_sync_header = ctk.CTkFrame(bandcamp_opts, fg_color="transparent")
+        bandcamp_archive_sync_header.grid(row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
+        ctk.CTkLabel(bandcamp_archive_sync_header, text="Archive / sync", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        bandcamp_archive_sync_help = self._make_help_bubble(bandcamp_archive_sync_header)
+        bandcamp_archive_sync_help.pack(side="left", padx=(6, 0))
+        self._bind_static_tooltip(bandcamp_archive_sync_help, ARCHIVE_SYNC_HELP_TEXT)
 
         self.bandcamp_use_archive = ctk.BooleanVar()
         self.bandcamp_use_archive_btn = ctk.CTkCheckBox(
@@ -3969,6 +3982,78 @@ class ScdlApp(ctk.CTk):
         x1 = tooltip.winfo_rootx()
         y1 = tooltip.winfo_rooty()
         return x1 <= px < x1 + tooltip.winfo_width() and y1 <= py < y1 + tooltip.winfo_height()
+
+    def _make_help_bubble(self, parent) -> ctk.CTkLabel:
+        """Small circular '?' label styled like the other help bubbles (auth
+        token, bandcamp cookies) -- caller still needs to bind a tooltip to it
+        via _bind_static_tooltip."""
+        return ctk.CTkLabel(
+            parent,
+            text="?",
+            width=22,
+            height=22,
+            corner_radius=11,
+            fg_color=("gray80", "gray30"),
+            text_color=("gray20", "gray90"),
+            font=ctk.CTkFont(weight="bold"),
+        )
+
+    def _bind_static_tooltip(self, widget, text: str, wraplength: int = 320):
+        """Hover tooltip showing fixed `text`, for a help bubble whose content
+        doesn't need per-instance state (unlike the auth-token/bandcamp-cookies
+        tooltips, which carry a hyperlink and dedicated show/hide methods).
+        Shared show/hide/destroy state lives in the closure rather than on
+        `self`, so this can be reused for any number of static-text bubbles
+        without adding a new pair of methods per bubble."""
+        state = {"tooltip": None, "hide_after": None}
+
+        def show(_event=None):
+            if state["hide_after"] is not None:
+                self.after_cancel(state["hide_after"])
+                state["hide_after"] = None
+            if state["tooltip"] is not None:
+                return
+            x = widget.winfo_rootx() - 30
+            y = widget.winfo_rooty() + 28
+            tooltip = self._make_tooltip_window(x, y)
+            label = ctk.CTkLabel(
+                tooltip,
+                text=text,
+                wraplength=wraplength,
+                justify="left",
+                fg_color=("gray95", "gray20"),
+                text_color=("gray10", "gray95"),
+                corner_radius=6,
+                font=ctk.CTkFont(size=13),
+            )
+            label.pack(ipadx=10, ipady=7)
+            tooltip.bind("<Enter>", show)
+            tooltip.bind("<Leave>", hide)
+            label.bind("<Enter>", show)
+            label.bind("<Leave>", hide)
+            self._finalize_tooltip_window(tooltip)
+            state["tooltip"] = tooltip
+
+        def hide(_event=None):
+            if state["hide_after"] is not None:
+                self.after_cancel(state["hide_after"])
+            state["hide_after"] = self.after(180, destroy)
+
+        def destroy():
+            tooltip = state["tooltip"]
+            if self._pointer_over_tooltip(tooltip):
+                # <Enter>/<Leave> on this borderless "help"-style popup don't
+                # fire reliably on macOS, so re-check the actual pointer
+                # position rather than trusting them.
+                state["hide_after"] = self.after(180, destroy)
+                return
+            state["hide_after"] = None
+            if tooltip is not None and tooltip.winfo_exists():
+                tooltip.destroy()
+            state["tooltip"] = None
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Leave>", hide)
 
     def _show_auth_tooltip(self, _event=None):
         if self._auth_tooltip_hide_after is not None:
