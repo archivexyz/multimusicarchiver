@@ -753,7 +753,21 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
         # incomplete download can never truncate or replace a good existing
         # file at the final path.
         part_path = file_path + '.part'
-        with open(part_path, 'wb') as fh:
+        # Local modification: never write through a symlink at the staging
+        # path. os.path.exists() misses a dangling symlink, so a plain
+        # open(part_path, 'wb') would follow it and write outside the download
+        # folder. A leftover *regular* .part from an interrupted run is fine to
+        # truncate; a symlinked one is removed first (that unlinks the link,
+        # not its target), and O_NOFOLLOW guards against a race re-creating it.
+        if os.path.islink(part_path):
+            try:
+                os.remove(part_path)
+            except OSError:
+                CONFIG['TQDM'].write('WARN: refusing to write through symlinked staging file [{}].'.format(part_path))
+                _album['download_status'] = 'Error'
+                return False
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        with os.fdopen(os.open(part_path, open_flags, 0o644), 'wb') as fh:
             for chunk in response.iter_content():
                 fh.write(chunk)
             actual_size = fh.tell()

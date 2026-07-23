@@ -226,16 +226,35 @@ def add_directory_to_user_path(directory: str):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+def atomic_write_text(target: str, write_fn, *, fsync: bool = True):
+    """Write `target` by filling a uniquely-named temp file in the same
+    directory and atomically swapping it in. The temp name is random
+    (tempfile.mkstemp) rather than a predictable '<target>.tmp'/'.session',
+    so a sibling file the user happens to already have there can never be
+    truncated out from under them; the temp is also cleaned up if the write
+    fails. `write_fn` receives the open text handle."""
+    directory = os.path.dirname(target) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".mma-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            write_fn(f)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(temp_path, target)
+    except BaseException:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
 def save_config(data: dict):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
     # Write-and-swap so a crash mid-write can't leave a truncated settings
     # file behind (which would then fail to parse on the next launch).
-    temp_path = CONFIG_PATH + ".tmp"
-    with open(temp_path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp_path, CONFIG_PATH)
+    atomic_write_text(CONFIG_PATH, lambda f: json.dump(data, f, indent=2))
 
 
 def load_config() -> dict:
@@ -1370,6 +1389,19 @@ def path_within_base(base: str, path: str) -> bool:
     return path_real == base_real or path_real.startswith(base_real + os.sep)
 
 
+def open_new_no_follow(path: str):
+    """Open `path` for binary writing as a brand-new regular file: never
+    following a symlink (O_NOFOLLOW) and never overwriting anything already
+    there (O_EXCL). A plain open(path, 'wb') follows a pre-existing symlink at
+    `path` -- including a dangling one, which os.path.exists() reports as
+    absent -- and would write through it to wherever it points, outside the
+    download folder. Raises FileExistsError if anything (file or symlink) is
+    already at `path`. O_NOFOLLOW is absent on Windows (getattr default 0);
+    there the caller's lexists-based collision check is the guard."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    return os.fdopen(os.open(path, flags, 0o644), "wb")
+
+
 def extract_zip_safely(zip_path: str, target_dir: str, containment_base: str | None = None):
     """Extracts every member of zip_path into target_dir, sanitizing each
     path segment for Windows-illegal characters and dropping '..'/'.'
@@ -1394,13 +1426,17 @@ def extract_zip_safely(zip_path: str, target_dir: str, containment_base: str | N
     claimed: set[str] = set()
 
     def claim(dest: str) -> str:
-        if os.path.normcase(dest) not in claimed and not os.path.exists(dest):
+        # lexists (not exists) so a pre-existing symlink -- including a
+        # dangling one, which exists() reports as absent -- counts as taken
+        # and is uniquified past, instead of being written through to whatever
+        # it points at outside the folder.
+        if os.path.normcase(dest) not in claimed and not os.path.lexists(dest):
             claimed.add(os.path.normcase(dest))
             return dest
         base, ext = os.path.splitext(dest)
         for index in range(1, 1000):
             candidate = f"{base} ({index}){ext}"
-            if os.path.normcase(candidate) not in claimed and not os.path.exists(candidate):
+            if os.path.normcase(candidate) not in claimed and not os.path.lexists(candidate):
                 claimed.add(os.path.normcase(candidate))
                 return candidate
         raise FileExistsError(f"No collision-free name available for {dest}")
@@ -1423,7 +1459,10 @@ def extract_zip_safely(zip_path: str, target_dir: str, containment_base: str | N
             # out -- verify the resolved parent before writing.
             if containment_base is not None and not path_within_base(containment_base, os.path.dirname(dest)):
                 continue
-            with archive.open(member) as source, open(dest, "wb") as target:
+            # claim() guarantees `dest` doesn't lexist; open it O_EXCL|
+            # O_NOFOLLOW so a symlink racing into place can't be followed out
+            # of the folder and nothing existing is overwritten.
+            with archive.open(member) as source, open_new_no_follow(dest) as target:
                 shutil.copyfileobj(source, target)
 
 
@@ -1880,12 +1919,11 @@ def compact_pending_claims(base_path: str, done_ids: set[str]):
             if os.path.exists(path):
                 os.remove(path)
             return
-        os.makedirs(PENDING_CLAIMS_DIR, exist_ok=True)
-        temp_path = path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            for item_id in sorted(remaining):
-                f.write(item_id + "\n")
-        os.replace(temp_path, path)
+        atomic_write_text(
+            path,
+            lambda f: f.writelines(f"{item_id}\n" for item_id in sorted(remaining)),
+            fsync=False,
+        )
     except OSError:
         pass
 
@@ -1925,21 +1963,19 @@ def append_bandcamp_archive(
         body_lines[-1] += "\n"
 
     new_total = len(existing_ids) + len(new_entries)
-    # Write to a sibling temp file and swap it in atomically: a crash or kill
-    # mid-write must never leave the archive truncated, since a wrong archive
-    # is what drives deletion decisions on the next run.
-    temp_path = archive_path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
+
+    # Swap in atomically via a random temp name: a crash or kill mid-write
+    # must never leave the archive truncated (a wrong archive is what drives
+    # deletion decisions on the next run), and the temp must not clobber an
+    # unrelated sibling file. atomic_write_text fsyncs before the replace, so
+    # a power loss right after the swap can't leave an empty archive either.
+    def _write(f):
         f.write(f"# total {new_total}\n")
         f.writelines(body_lines)
         for item_id, label in new_entries:
             f.write(f"{entry_prefix} {item_id} {label}\n")
-        # Force the bytes to disk before the swap: without this, a power
-        # loss right after os.replace() can leave an empty archive on some
-        # filesystems, and a wrong archive drives deletion decisions.
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp_path, archive_path)
+
+    atomic_write_text(archive_path, _write)
     return len(new_entries)
 
 
@@ -2431,7 +2467,6 @@ def filter_archived_originals(
         # Point the run at a session copy with the retried ids removed, and
         # merge whatever the run appends back into the real archive afterwards.
         try:
-            session_path = archive_path + ".session"
             session_lines = []
             with open(archive_path, encoding="utf-8") as archive_file:
                 for line in archive_file:
@@ -2439,7 +2474,13 @@ def filter_archived_originals(
                     if entry and archive_line_track_id(entry) in retried_ids:
                         continue
                     session_lines.append(line if line.endswith("\n") else line + "\n")
-            with open(session_path, "w", encoding="utf-8") as session_file:
+            # Random temp name in the archive's directory rather than a
+            # predictable '<archive>.session', so it can't truncate a sibling
+            # file the user already has.
+            session_dir = os.path.dirname(archive_path) or "."
+            os.makedirs(session_dir, exist_ok=True)
+            fd, session_path = tempfile.mkstemp(prefix=".mma-session-", suffix=".txt", dir=session_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as session_file:
                 session_file.writelines(session_lines)
             index = filtered_cmd.index("--download-archive") + 1
             if index < len(filtered_cmd):

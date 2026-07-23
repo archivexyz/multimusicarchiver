@@ -5,10 +5,11 @@ A GUI that wraps [scdl](https://github.com/scdl-org/scdl) (SoundCloud) and
 library from either service, with optional daily scheduling and deleted track checking.
 
 ## ⚠️ Safety Notice
-I am not a developer and almost all of the code in this program is written by an LLM. Accordingly, 
-this program can only delete / overwrite files that itself downloaded or are identical to files it
-is downloading (exact name, layout, and Bandcamp ID in its filename). If you want to be *absolutely certain* of no data
-loss, point the save directories to fresh folders.
+I am not a developer and almost all of the code in this program is written by an LLM. It is
+designed to only modify, rename, move, or delete files that it downloaded itself, or files that
+share the exact filename, folder layout, and embedded SoundCloud/Bandcamp ID of what it is currently
+downloading. See [Modification Rules](#modification-rules) for exact scenarios. Since the code is LLM-written, if 
+you want to be *absolutely certain* of no data loss, point the save directories to fresh, empty folders.
 
 ## Download
 
@@ -133,4 +134,95 @@ Available for both services. Registers an OS-level daily task (macOS: LaunchAgen
 Scheduler, Linux: cron) that reruns the configured profile at a fixed time, independent of the GUI
 being open.
 
+## Modification Rules
 
+Every scenario below is something the app can do to a file inside your "Save to" folder, and why it
+has to. Paths are shown relative to that folder; `<id>` is a real SoundCloud/Bandcamp ID.
+
+### What must be true before any file is touched
+
+A file is only ever eligible if **all** of these hold:
+
+- Its name carries a bracketed ID of **7 or more digits** — the format this app writes. This
+  deliberately excludes human naming conventions like `[1997] OK Computer.zip`, `[01] Intro.mp3`,
+  and date-style names like `[210415] Artist - Live Set.zip`, none of which can ever be claimed.
+- **Bandcamp:** it also sits in the exact `<Artist>/` layout the downloader writes, *and* its ID is
+  one this app can prove it downloaded — present in your archive file, seen in this run's download
+  log, or recorded in the pending-claims file from a run that was interrupted.
+- **SoundCloud:** with an archive file, its ID must be listed in that archive. Without one, the file
+  must not have existed when the download started (the folder is snapshotted beforehand).
+
+**Anything failing these is left strictly alone.**
+
+### SoundCloud
+
+**Tags written and the `[id]` removed from the filename**
+```[318947562] Four Tet - Angel Echoes.mp3   →   Four Tet - Angel Echoes.mp3``` (only if 318947562 is in the selected archive.txt)
+*Why:* the SoundCloud track ID is written into the file's metadata so the **Archive Check** feature
+can match your local files back to SoundCloud and tell you which tracks have since been deleted or
+made private. Storing the ID in the tag rather than the filename means it survives renames and you
+still get clean filenames. The archive preflight also uses these tags to see which archived tracks
+you no longer have locally, so it can re-download only those instead of everything. This runs after
+each download, and also *before* a download when an archive is configured, to finish tagging files
+left behind by a previous run that was interrupted.
+
+If the clean name is already taken, the new file becomes `Four Tet - Angel Echoes (1).mp3` — an
+existing file is never overwritten.
+
+### Bandcamp
+
+**Album zip extracted, then the zip deleted** (only with "Extract" enabled)
+```
+Artist/[1234567] Artist - Album.zip   →   Artist/Artist - Album/…
+```
+*Why:* extraction is the point of the option, and the zip is removed afterwards because its contents
+now exist on disk — keeping both would roughly double the disk usage of an entire library. Extracted
+files never overwrite anything: a name collision becomes `Track (1).mp3`.
+
+**Single track filed into `Singles/` and renamed**
+```
+Artist/[1234567] Artist - Track.mp3   →   Artist/Singles/Artist - Track.mp3
+```
+*Why:* Bandcamp delivers single tracks as bare audio files rather than zips, so without this they'd
+sit loose in the artist folder alongside album folders. This gives singles the same clean, ID-free
+naming that extracted albums get. Collisions become `Artist - Track (1).mp3`.
+
+**Leftover `.part` staging file deleted**
+```
+Artist/[1234567] Artist - Album.zip.part
+```
+*Why:* downloads stream to a `.part` file and are only moved into place after passing a size and
+zip-structure check, so a stopped or interrupted download can never leave a truncated file at the
+real path. The `.part` left behind by that stopped attempt is dead weight and gets cleaned up on the
+next run.
+
+**An earlier incomplete download replaced**
+```
+Artist/[1234567] Artist - Album.zip   (content replaced)
+```
+*Why:* Bandcamp reports each album's expected size. If the file already on disk doesn't match, it is
+assumed to be a damaged or partial earlier download (or the album was re-uploaded) and is fetched
+again. The replacement only happens after the new copy passes validation. **This is the one case
+where a file's content is genuinely overwritten** — so a different file that happens to share the
+exact name, layout, and ID would be replaced. With **Extract enabled this never occurs**, since a
+successfully extracted zip is deleted right after extraction, leaving no file at that path to
+compare sizes against.
+
+**Redundant re-download deleted**
+```
+Artist/[1234567] Artist - Album.zip   (deleted)
+```
+*Why:* Bandcamp orders your collection by most recently *acquired*, not released — buying a
+discography bundle re-surfaces albums you already own. Without this, every sync would re-download
+and re-extract albums you already have. The file is only deleted once the extracted folder (or
+enough sorted singles) is confirmed to actually exist on disk with real audio in it; if that output
+is missing, the fresh download is kept instead so the loss self-heals.
+
+**Corrupt zip quarantined — renamed, not deleted**
+```
+Artist/[1234567] Artist - Album.zip   →   Artist/[1234567] Artist - Album.zip.corrupt
+```
+*Why:* a structurally broken zip can't be extracted, and renaming it off `.zip` makes the next sync
+fetch a fresh copy. It is renamed rather than deleted so the bytes remain recoverable if the
+corruption verdict was ever wrong. Zips that can't be judged at all (encrypted members, unsupported
+compression) are left completely untouched rather than assumed broken.
