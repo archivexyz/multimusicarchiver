@@ -4,21 +4,46 @@ A GUI that wraps [scdl](https://github.com/scdl-org/scdl) (SoundCloud) and
 [bandcamp-downloader](https://github.com/easlice/bandcamp-downloader) (Bandcamp) for archiving your
 library from either service, with optional daily scheduling and deleted track checking.
 
-**Download the latest standalone build:**
-[macOS](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-macos.zip) ·
-[Windows](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-windows.zip) ·
-[Linux](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-linux.zip)
+## Download
+
+Standalone builds -- no Python or `pip install` required.
+
+<table>
+<tr>
+<td align="center" width="33%">
+
+### macOS
+
+[**Download**](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-macos.zip)
+
+</td>
+<td align="center" width="33%">
+
+### Windows
+
+[**Download**](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-windows.zip)
+
+</td>
+<td align="center" width="33%">
+
+### Linux
+
+[**Download**](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-linux.zip)
+
+</td>
+</tr>
+</table>
 
 Builds are unsigned -- macOS will require right-click → Open the first launch (Gatekeeper), and
 Windows will show a SmartScreen warning to click through.
 
-## Requirements (from git clone)
+## Requirements
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Running (from git clone)
+## Running
 
 ```bash
 python source/multimusicarchiver.py
