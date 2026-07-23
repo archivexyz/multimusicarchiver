@@ -4,10 +4,10 @@ A GUI that wraps [scdl](https://github.com/scdl-org/scdl) (SoundCloud) and
 [bandcamp-downloader](https://github.com/easlice/bandcamp-downloader) (Bandcamp) for archiving your
 library from either service, with optional daily scheduling and deleted track checking.
 
-bandcamp-downloader is vendored directly into this app (`source/vendor_bandcamp_downloader.py`,
-MIT licensed) rather than installed separately, so it's always available -- including in the
-frozen Mac/Windows/Linux builds. scdl remains a normal pip dependency with its own
-install/update button in the GUI.
+**Download the latest build:**
+[macOS](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-macos.zip) ·
+[Windows](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-windows.zip) ·
+[Linux](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-linux.zip)
 
 ## Requirements
 
