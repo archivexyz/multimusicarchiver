@@ -95,6 +95,24 @@ def child_process_env() -> dict:
     return env
 
 
+def reconfigure_embedded_std_streams():
+    """The frozen app's bootloader (PyInstaller >= 6) starts Python with an
+    isolated config that ignores PYTHONUNBUFFERED/PYTHONIOENCODING, so the
+    env vars from child_process_env() do nothing for a frozen child process:
+    its stdout into the GUI's pipe stays block-buffered (tqdm's bar on stderr
+    shows up live, but 'Album being saved to' lines sit in the buffer --
+    breaking both the live log and the archive-boundary detection that needs
+    them in real time) and on Windows it falls back to the legacy codepage.
+    Reconfigure the streams in-process instead. Harmless when running from
+    source, and guarded because a windowed frozen app launched without pipes
+    may have stub streams that don't support reconfigure()."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except Exception:
+            pass
+
+
 def user_scripts_dir() -> str:
     if os.name == "nt":
         scheme = "nt_user"
@@ -4153,6 +4171,7 @@ class ScdlApp(ctk.CTk):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def run_embedded_scdl(args: list[str]) -> int:
+    reconfigure_embedded_std_streams()
     import yt_dlp
 
     sys.modules.setdefault("yt_dlp.__init__", yt_dlp)
@@ -4170,11 +4189,18 @@ def run_embedded_scdl(args: list[str]) -> int:
         if err.code is None:
             return 0
         return err.code if isinstance(err.code, int) else 1
+    except Exception:
+        # Return a clean nonzero exit instead of letting the frozen
+        # bootloader report an unhandled-exception error on top of it.
+        import traceback
+        traceback.print_exc()
+        return 1
     finally:
         sys.argv = old_argv
 
 
 def run_embedded_bandcamp(args: list[str]) -> int:
+    reconfigure_embedded_std_streams()
     import vendor_bandcamp_downloader as bandcamp_downloader
 
     unsafe_path_segments = {"", ".", ".."}
@@ -4207,11 +4233,20 @@ def run_embedded_bandcamp(args: list[str]) -> int:
         if err.code is None:
             return 0
         return err.code if isinstance(err.code, int) else 1
+    except Exception:
+        # A hard failure (e.g. the network dying after all retries) should
+        # exit cleanly with the traceback in the log, not crash the frozen
+        # bootloader with an unhandled-exception error.
+        import traceback
+        traceback.print_exc()
+        print("ERROR: bandcamp-downloader run failed; see the traceback above.", flush=True)
+        return 1
     finally:
         sys.argv = old_argv
 
 
 def run_inline_helper(source: str, args: list[str]) -> int:
+    reconfigure_embedded_std_streams()
     old_argv = sys.argv[:]
     namespace = {"__name__": "__main__"}
     try:
@@ -4224,11 +4259,22 @@ def run_inline_helper(source: str, args: list[str]) -> int:
         if err.code is None:
             return 0
         return err.code if isinstance(err.code, int) else 1
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 1
     finally:
         sys.argv = old_argv
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    # In the frozen app a multiprocessing worker re-executes this same
+    # binary; without this guard it would fall through the argv checks below
+    # and open another GUI window instead of running as a worker.
+    multiprocessing.freeze_support()
+
     if "--run-scdl" in sys.argv:
         index = sys.argv.index("--run-scdl")
         raise SystemExit(run_embedded_scdl(sys.argv[index + 1:]))

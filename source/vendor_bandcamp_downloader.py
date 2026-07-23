@@ -9,6 +9,16 @@ Local modifications from upstream (marked inline with "Local modification"):
   * The verbose 'Found [N] downloadable items' line is printed after
     --download-since/--download-until filtering, so N matches the number of
     items the run will actually iterate (the GUI wrapper parses this line).
+  * fetch_items() retries transient network failures (it is the first network
+    call of a run and a single dropped connection used to be fatal), and the
+    initial user-page fetch goes through pagedata_with_retry().
+  * _log_line() routes log output through the tqdm bar only once it exists;
+    several failure paths used to call CONFIG['TQDM'].write while TQDM was
+    still None and crashed instead of reporting the real error.
+  * download_file() treats Content-Length and Content-Disposition as optional
+    (very large albums are served chunked without them); when the size is
+    unknown, downloaded zips are structure-validated before being moved into
+    place so a truncated transfer can't pass as complete.
 
 bandcamp-downloader is distributed under the MIT License:
 
@@ -299,6 +309,16 @@ def main() -> int:
 
     return 0
 
+# Local modification: log through the progress bar when it exists, plain
+# print before it's created. Several failure paths used to call
+# CONFIG['TQDM'].write while TQDM was still None and crashed with an
+# AttributeError instead of reporting the actual error.
+def _log_line(_msg : str) -> None:
+    if CONFIG['TQDM'] is not None:
+        CONFIG['TQDM'].write(_msg)
+    else:
+        print(_msg)
+
 # Fetch item data for the given user via the bandcamp API, then return the
 # 'items' subobject, with 'redownload_url' and 'filename' fields added to each.
 def fetch_items(_hidden : bool, _user_id : str, _last_token : str, _count : int) -> dict:
@@ -309,16 +329,28 @@ def fetch_items(_hidden : bool, _user_id : str, _last_token : str, _count : int)
         'count' : _count,
         'older_than_token' : _last_token,
     }
-    response = requests.post(
-        url,
-        data = json.dumps(payload),
-        cookies = CONFIG['COOKIE_JAR'],
-        impersonate='chrome'
-    )
-    response.raise_for_status()
-    data = json.loads(response.text)
-
-    return merge_items_and_urls(data['items'], data['redownload_urls'] or {})
+    # Local modification: retry transient network failures using the same
+    # attempt/wait settings as the album downloads. This is one of the first
+    # network calls of a run and a single dropped connection (e.g. curl
+    # error 56) used to crash the whole run before anything was downloaded.
+    last_error = None
+    for attempt in range(CONFIG['MAX_URL_ATTEMPTS']):
+        if attempt != 0: time.sleep(CONFIG['URL_RETRY_WAIT'])
+        try:
+            response = requests.post(
+                url,
+                data = json.dumps(payload),
+                cookies = CONFIG['COOKIE_JAR'],
+                impersonate='chrome'
+            )
+            response.raise_for_status()
+            data = json.loads(response.text)
+            return merge_items_and_urls(data['items'], data['redownload_urls'] or {})
+        except Exception as e:
+            last_error = e
+            _log_line('WARN: attempt [{}/{}] to fetch collection items failed: {}'.format(
+                attempt + 1, CONFIG['MAX_URL_ATTEMPTS'], e))
+    raise last_error
 
 # Loads the given url and looks for the 'pagedata' div and, if found,
 # returns its 'data-blob' property decoded from json.
@@ -341,7 +373,8 @@ def get_items_for_user(_user : str, _include_hidden : bool) -> dict:
     # Get the initial metadata from the json in the 'data-blob' div on the
     # user landing page.
     user_url = USER_URL.format(_user)
-    data = pagedata_for_url(user_url)
+    # Local modification: was a bare pagedata_for_url() call with no retry.
+    data = pagedata_with_retry(user_url)
     if not data:
         print('ERROR: No data found at user url [{}]'.format(user_url))
         exit(2)
@@ -496,12 +529,12 @@ def pagedata_with_retry(_url : str) -> dict:
         try:
             data = pagedata_for_url(_url)
             if data: return data
-            if CONFIG['VERBOSE']: CONFIG['TQDM'].write('WARN: no pagedata found fetching album url [{}] (you may be rate-limited, try increasing --wait-after-download or --retry-wait)'.format(_url))
+            if CONFIG['VERBOSE']: _log_line('WARN: no pagedata found fetching album url [{}] (you may be rate-limited, try increasing --wait-after-download or --retry-wait)'.format(_url))
         except IOError as e:
-            if CONFIG['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the page data at [{}].'.format(attempt, _url))
+            if CONFIG['VERBOSE'] >=2: _log_line('WARN: I/O Error on attempt # [{}] to download the page data at [{}].'.format(attempt, _url))
         except Exception as e:
             print_exception(e, 'An exception occurred trying to download album url [{}]:'.format(_url))
-    CONFIG['TQDM'].write("ERROR: Couldn't download pagedata for album at url [{}]".format(_url))
+    _log_line("ERROR: Couldn't download pagedata for url [{}]".format(_url))
     return {}
 
 # Download the file for the given bandcamp album, and notify TQDM when done.
@@ -576,8 +609,15 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
         )
         response.raise_for_status()
 
-        expected_size = int(response.headers['content-length'])
-        filename_match = FILENAME_REGEX.search(response.headers['content-disposition'])
+        # Local modification: some downloads (typically very large albums) are
+        # served chunked with no Content-Length header, and Content-Disposition
+        # is not guaranteed either -- treat both as optional instead of
+        # crashing with a KeyError right as the transfer would have started.
+        try:
+            expected_size = int(response.headers['content-length'])
+        except (KeyError, ValueError):
+            expected_size = None
+        filename_match = FILENAME_REGEX.search(response.headers.get('content-disposition', ''))
         original_filename = urllib.parse.unquote(filename_match.group(1)) if filename_match else _url.split('/')[-1]
         extension = os.path.splitext(original_filename)[1]
         if extension != '' and extension != _album['extension']:
@@ -590,7 +630,7 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
             # files against the album's size metadata, but check one last
             # time if we already have a file of the right size.
             actual_size = os.stat(file_path).st_size
-            if expected_size == actual_size:
+            if expected_size is not None and expected_size == actual_size:
                 if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Canceling download that matches existing file: [{}]'.format(file_path))
                 _album['download_status'] = 'Skipped'
                 return False
@@ -606,12 +646,27 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
             for chunk in response.iter_content():
                 fh.write(chunk)
             actual_size = fh.tell()
-        if expected_size != actual_size:
+        if expected_size is not None and expected_size != actual_size:
             try:
                 os.remove(part_path)
             except OSError:
                 pass
             raise IOError('Incomplete read. {} bytes read, {} bytes expected'.format(actual_size, expected_size))
+        if expected_size is None and _is_zip(file_path):
+            # No Content-Length to verify against, so a truncated chunked
+            # transfer would otherwise pass silently -- at least confirm the
+            # zip's structure is intact before moving it into place.
+            try:
+                with zipfile.ZipFile(part_path) as zip_file:
+                    bad_member = zip_file.testzip()
+            except Exception as e:
+                bad_member = str(e)
+            if bad_member is not None:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+                raise IOError('Downloaded zip failed validation ({}); the transfer was likely truncated'.format(bad_member))
         os.replace(part_path, file_path)
         _album['download_status'] = 'Downloaded'
         return True
@@ -640,9 +695,9 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
     return False
 
 def print_exception(_e : Exception, _msg : str = '') -> None:
-    CONFIG['TQDM'].write('\nERROR: {}'.format(_msg))
-    CONFIG['TQDM'].write('\n'.join(traceback.format_exception(_e, value=_e , tb=_e.__traceback__)))
-    CONFIG['TQDM'].write('\n')
+    _log_line('\nERROR: {}'.format(_msg))
+    _log_line('\n'.join(traceback.format_exception(_e, value=_e , tb=_e.__traceback__)))
+    _log_line('\n')
 
 # Windows has some picky requirements about file names
 # So let's replace known bad characters with '-'
