@@ -6,7 +6,7 @@ library from either service, with optional daily scheduling and deleted track ch
 
 ## Download
 
-Standalone builds -- no Python or `pip install` required.
+Standalone builds: no Python or `pip install` required.
 
 <table>
 <tr>
@@ -34,7 +34,7 @@ Standalone builds -- no Python or `pip install` required.
 </tr>
 </table>
 
-Builds are unsigned -- macOS will require right-click → Open the first launch (Gatekeeper), and
+Builds are unsigned! MacOS will require right-click → Open the first launch (Gatekeeper), and
 Windows will show a SmartScreen warning to click through.
 
 ## Requirements
