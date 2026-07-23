@@ -23,6 +23,13 @@ Local modifications from upstream (marked inline with "Local modification"):
     offered) additionally log a machine-readable 'Item permanently
     unavailable: [id] artist - title' line via _mark_unavailable(), which the
     GUI wrapper records as a 'bandcamp-skip' archive entry.
+  * download_file() inspects the received bytes (_unavailable_response_reason)
+    when a download doesn't validate: an expired/removed download is served as
+    an error page or statdownload error rather than the audio, so it is
+    recorded as permanently unavailable instead of being streamed to disk,
+    failing zip validation, retried, and left unrecorded -- which made the
+    item's collection-total accounting never reconcile and every sync re-walk
+    the whole collection retrying it.
 
 bandcamp-downloader is distributed under the MIT License:
 
@@ -564,6 +571,89 @@ def _mark_unavailable(_album : dict) -> None:
     _log_line('Item permanently unavailable: [{}] {} - {}'.format(
         _album.get('item_id', ''), _album.get('band_name', ''), _album.get('item_title', '')))
 
+# Local modification: tokens that only appear when bandcamp serves an error in
+# place of the actual audio -- either its statdownload JSON error result, or
+# the download/reauth page HTML. Used to tell a permanently-failed download
+# (expired link, disconnected purchase email, removed/disabled download) from a
+# merely truncated transfer, so the former is recorded as unavailable instead
+# of being retried on every future sync.
+_UNAVAILABLE_BODY_TOKENS = (
+    'serverside_err_expired',
+    'expiredfreedownloaderror',
+    'expirationerror',
+    'serverside_err_deleted',
+    'deletederror',
+    'serverside_err_exceeds_free',
+    'exceedsfreedownloadserror',
+    'serverside_err_no_longer_free',
+    'nolongerfreeerror',
+    'serverside_err_downloads_disabled',
+    'downloadsdisablederror',
+    'nosuchbanderror',
+)
+
+
+def _unavailable_response_reason(_part_path : str, _size : int, _content_type : str):
+    """When a download doesn't validate as the expected media, decide whether
+    the bytes we actually received are an error response (permanently
+    unavailable) rather than a truncated transfer (retryable). Returns a short
+    reason string when the payload is a recognized bandcamp error/reauth
+    response, else None.
+
+    This only ever inspects payloads small enough to be an error page (a real
+    album is far larger), and matches conservatively: a JSON 'result:err', the
+    bandcamp download/reauth page markup, or a known server-error token. A
+    generic/unknown page (e.g. a transient rate-limit or captcha page) returns
+    None so it stays retryable and is never mistaken for a permanent failure."""
+    is_texty = _content_type.startswith('text/') or _content_type == 'application/json'
+    # A genuine album/track is much larger than any error page; don't slurp a
+    # big binary payload just to scan it (unless the server itself labeled it
+    # as text, in which case it's definitely not the media).
+    if _size > 2_000_000 and not is_texty:
+        return None
+    try:
+        with open(_part_path, 'rb') as fh:
+            head = fh.read(131072)
+    except OSError:
+        return None
+    text = head.decode('utf-8', 'replace')
+    lowered = text.lower()
+    stripped = lowered.lstrip()
+    if stripped.startswith('{') or _content_type == 'application/json':
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get('result') == 'err':
+            return 'server error: {}'.format(data.get('errortype') or 'unknown')
+    # The download endpoint returned bandcamp's download/reauth page instead of
+    # the file -- these markers are specific to that page.
+    if 'id="pagedata"' in lowered or 'email-reauth-error' in lowered or '/download_2016/' in lowered:
+        return 'download/reauth page returned instead of the audio file'
+    for token in _UNAVAILABLE_BODY_TOKENS:
+        if token in lowered:
+            return 'server error token: {}'.format(token)
+    # Any other HTML in place of the audio: a successful download is never
+    # HTML, and per bandcamp's behavior a failure at the download url (unlike a
+    # rate-limit, which is handled earlier when fetching the page) does not
+    # recover. Still exclude a transient bot-challenge / rate-limit page so it
+    # stays retryable rather than being recorded as permanently gone.
+    looks_html = (
+        _content_type == 'text/html'
+        or stripped.startswith('<!doctype html')
+        or stripped.startswith('<html')
+    )
+    if looks_html:
+        transient_markers = (
+            'just a moment', 'checking your browser', 'cloudflare',
+            'cf-browser-verification', 'rate limit', 'too many requests',
+            'captcha', 'access denied', 'retry',
+        )
+        if not any(marker in lowered for marker in transient_markers):
+            return 'html error page returned instead of the audio file'
+    return None
+
+
 # Download the file for the given bandcamp album. Sets the key 'extension'
 # to the file extension for this item, and the key 'downloaded' to whether
 # a file was successfully downloaded.
@@ -667,6 +757,27 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
             for chunk in response.iter_content():
                 fh.write(chunk)
             actual_size = fh.tell()
+        # Local modification: bandcamp serves an expired/removed download (the
+        # link's window lapsed, or the purchasing email was disconnected) as an
+        # error page or statdownload error rather than the audio -- with no
+        # Content-Length, so it would otherwise be streamed to disk, fail zip
+        # validation, be retried, and end as a generic 'Exception' that is
+        # never recorded, making every future sync re-walk the whole
+        # collection. Detect that the received bytes are such an error response
+        # and record the item as permanently unavailable instead (a
+        # 'bandcamp-skip' archive entry via the GUI wrapper). A truncated
+        # transfer looks like real (partial) media, not an error page, so it
+        # still falls through to the retry path below.
+        content_type = response.headers.get('content-type', '').split(';')[0].strip().lower()
+        unavailable_reason = _unavailable_response_reason(part_path, actual_size, content_type)
+        if unavailable_reason is not None:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            CONFIG['TQDM'].write('WARN: download for [{}] returned an error response, not the audio file ({}). The download has likely expired; re-download it manually from bandcamp (you may need to re-enter your purchase email). Recording it so future syncs skip it.'.format(file_path, unavailable_reason))
+            _mark_unavailable(_album)
+            return False
         if expected_size is not None and expected_size != actual_size:
             try:
                 os.remove(part_path)

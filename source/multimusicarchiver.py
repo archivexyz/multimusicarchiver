@@ -5,9 +5,11 @@ Requirements: pip install customtkinter scdl
 """
 
 import argparse
+import atexit
 import base64
 import hashlib
 import html
+import signal
 import sys
 import sysconfig
 
@@ -247,6 +249,166 @@ def load_config() -> dict:
             return {}
         return data if isinstance(data, dict) else {}
     return {}
+
+
+# ── Download lock ─────────────────────────────────────────────────────────────
+# A single machine-wide lock so a GUI download and a scheduled background sync
+# (or two scheduled runs) can never touch the same download folders/archives at
+# once -- concurrent runs would otherwise delete each other's ".part" staging
+# files and race the read-modify-write of the archive.
+DOWNLOAD_LOCK_PATH = os.path.join(CONFIG_DIR, "download.lock")
+# A download run is never legitimately this long; a lock older than this whose
+# owning PID looks alive is treated as a reused-PID leftover rather than a live
+# run, so a crash can never wedge downloads permanently.
+DOWNLOAD_LOCK_STALE_SECONDS = 24 * 60 * 60
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            # If we can't tell, assume alive: refusing to run is safe, a
+            # spurious second concurrent run is not.
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+class DownloadInProgress(Exception):
+    """Raised when another download already holds the lock. Carries a short,
+    user-facing description of the current holder."""
+
+    def __init__(self, holder: str):
+        super().__init__(holder)
+        self.holder = holder
+
+
+class DownloadLock:
+    """Best-effort cross-platform mutex backed by an O_EXCL lock file holding
+    the owner's PID. Cleared on graceful release (context-manager exit, atexit,
+    the GUI's close handler, and the scheduled runners' signal handlers); a
+    hard kill that skips all of those leaves the file behind, but the next run
+    detects the dead PID (or an implausibly old lock) and clears it, so a
+    crash can never permanently block downloads."""
+
+    def __init__(self, path: str | None = None):
+        # Resolve at call time rather than binding the module default at import,
+        # so the lock path always tracks the current config directory.
+        self.path = path or DOWNLOAD_LOCK_PATH
+        self.acquired = False
+
+    def _holder_description(self) -> str:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError:
+            return "another download"
+        parts = content.split(maxsplit=1)
+        pid = parts[0] if parts else "?"
+        started = parts[1] if len(parts) > 1 else "unknown time"
+        return f"PID {pid}, started {started}"
+
+    def _clear_if_stale(self) -> bool:
+        """Remove the lock file iff its owner is gone (dead PID, unreadable/
+        garbage contents, or implausibly old). Returns True if it was cleared."""
+        pid = None
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                content = f.read().strip()
+            pid = int(content.split(maxsplit=1)[0])
+        except (OSError, ValueError, IndexError):
+            pid = None  # unreadable/garbage -> stale
+
+        stale = pid is None or not _pid_alive(pid)
+        if not stale:
+            try:
+                age = datetime.now().timestamp() - os.path.getmtime(self.path)
+                stale = age > DOWNLOAD_LOCK_STALE_SECONDS
+            except OSError:
+                stale = False
+        if not stale:
+            return False
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def acquire(self) -> bool:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                if self._clear_if_stale():
+                    continue  # cleared a dead lock -> retry the create once
+                return False
+            except OSError:
+                return False
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}\n")
+            self.acquired = True
+            atexit.register(self.release)
+            return True
+        return False
+
+    def acquire_or_raise(self):
+        holder = self._holder_description() if os.path.exists(self.path) else "another download"
+        if not self.acquire():
+            raise DownloadInProgress(holder)
+
+    def release(self):
+        if not self.acquired:
+            return
+        self.acquired = False
+        try:
+            # Only remove a lock file that is still ours, so a stolen-stale
+            # lock now held by someone else is never deleted out from under
+            # them.
+            with open(self.path, encoding="utf-8") as f:
+                owner_pid = int(f.read().strip().split(maxsplit=1)[0])
+            if owner_pid != os.getpid():
+                return
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self.acquire_or_raise()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
 
 
 def resolve_scdl_path(profile: dict | None = None) -> str | None:
@@ -2343,17 +2505,38 @@ def prune_scheduled_logs(days: int = 7):
             pass
 
 
+def _run_scheduled_locked(profile: dict, out, log_stream) -> int:
+    """Runs a scheduled profile under the machine-wide download lock. If a
+    GUI download or another scheduled run already holds it, this run is
+    skipped (it will run again on the next scheduled tick) rather than racing
+    the same folders/archives."""
+    lock = DownloadLock()
+    try:
+        lock.acquire_or_raise()
+    except DownloadInProgress as err:
+        print(
+            f"Another download is already in progress ({err.holder}); skipping this "
+            "scheduled run to avoid two downloads touching the same files at once.",
+            file=out, flush=True,
+        )
+        return 0
+    try:
+        return run_scheduled_profile(profile, out, log_stream)
+    finally:
+        lock.release()
+
+
 def run_scheduled_download(payload: str, log_stream=None) -> int:
     out = log_stream or sys.stdout
     profile = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
-    return run_scheduled_profile(profile, out, log_stream)
+    return _run_scheduled_locked(profile, out, log_stream)
 
 
 def run_scheduled_download_file(path: str, log_stream=None) -> int:
     out = log_stream or sys.stdout
     with open(os.path.expanduser(path), encoding="utf-8") as f:
         profile = json.load(f)
-    return run_scheduled_profile(profile, out, log_stream)
+    return _run_scheduled_locked(profile, out, log_stream)
 
 
 def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
@@ -2481,7 +2664,27 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
     return rc
 
 
+def install_termination_handlers():
+    """Convert SIGTERM/SIGINT into a normal exception-driven shutdown so
+    `finally` blocks and atexit handlers run -- in particular releasing the
+    download lock -- when a scheduler (launchd/cron/schtasks) or the user stops
+    a scheduled run. A hard kill still bypasses this, but the next run detects
+    the stale lock and clears it."""
+    def handler(signum, _frame):
+        raise SystemExit(130 if signum == getattr(signal, "SIGINT", None) else 143)
+
+    for signame in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, signame, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                # Not on the main thread, or unsupported -- skip.
+                pass
+
+
 def run_scheduled_download_with_log(payload: str) -> int:
+    install_termination_handlers()
     os.makedirs(LOG_DIR, exist_ok=True)
     prune_scheduled_logs()
     started = datetime.now()
@@ -2505,6 +2708,7 @@ def run_scheduled_download_with_log(payload: str) -> int:
 
 
 def run_scheduled_download_file_with_log(path: str) -> int:
+    install_termination_handlers()
     os.makedirs(LOG_DIR, exist_ok=True)
     prune_scheduled_logs()
     started = datetime.now()
@@ -2940,6 +3144,7 @@ class ScdlApp(ctk.CTk):
         self._archive_scan_active = False
         self._download_stopping = False
         self._active_download_profile: dict | None = None
+        self._download_lock: DownloadLock | None = None
         self._undo_stack: list[tuple[ctk.CTkEntry, str, str]] = []
         self._config = load_config()
         self._scdl_installer_running = False
@@ -4413,6 +4618,21 @@ class ScdlApp(ctk.CTk):
         if not cmd:
             return
 
+        # Hold the machine-wide download lock for the whole run so a scheduled
+        # background sync (or a second window) can't download into the same
+        # folders/archives at the same time.
+        download_lock = DownloadLock()
+        try:
+            download_lock.acquire_or_raise()
+        except DownloadInProgress as err:
+            messagebox.showinfo(
+                "Download already in progress",
+                f"Another download is already running ({err.holder}) — this may be a scheduled "
+                "background sync. Please wait for it to finish before starting a new one.",
+            )
+            return
+        self._download_lock = download_lock
+
         profile = self._current_profile()
         preflight_archive = profile.get("service") != "bandcamp" and profile.get("use_archive")
         self._active_download_profile = dict(profile)
@@ -4639,6 +4859,8 @@ class ScdlApp(ctk.CTk):
                 self.after(0, lambda: self._on_done(1))
             finally:
                 self._process = None
+                download_lock.release()
+                self._download_lock = None
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -4727,6 +4949,11 @@ class ScdlApp(ctk.CTk):
             for process in (self._process, self._archive_scan_process):
                 if process and process.poll() is None:
                     terminate_process_tree(process)
+            # Release the download lock now rather than leaving it for the next
+            # run's stale detection, so closing mid-download frees it at once.
+            if self._download_lock is not None:
+                self._download_lock.release()
+                self._download_lock = None
             self.destroy()
 
     def _load_saved_values(self):
