@@ -4,28 +4,25 @@ A GUI that wraps [scdl](https://github.com/scdl-org/scdl) (SoundCloud) and
 [bandcamp-downloader](https://github.com/easlice/bandcamp-downloader) (Bandcamp) for archiving your
 library from either service, with optional daily scheduling and deleted track checking.
 
-**Download the latest build:**
+**Download the latest standalone build:**
 [macOS](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-macos.zip) ·
 [Windows](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-windows.zip) ·
 [Linux](https://github.com/archivexyz/multimusicarchiver/releases/latest/download/MultiMusicArchiver-linux.zip)
 
-## Requirements
+Builds are unsigned -- macOS will require right-click → Open the first launch (Gatekeeper), and
+Windows will show a SmartScreen warning to click through.
+
+## Requirements (from git clone)
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Running
+## Running (from git clone)
 
 ```bash
 python source/multimusicarchiver.py
 ```
-
-Where a checkbox or field is passed straight through as a CLI flag to `scdl` or
-`bandcamp-downloader`, the description below is the tool's own help text for that flag
-(near-verbatim), not our own paraphrase. Where a control is handled entirely by this app instead
-(noted below), the tool's flag doesn't apply and its own description is given instead.
-
 ## SoundCloud (scdl)
 
 **Download type**
@@ -104,27 +101,5 @@ as `cookie.txt`. These are only your cookies for bandcamp.com.
 Available for both services. Registers an OS-level daily task (macOS: LaunchAgents, Windows: Task
 Scheduler, Linux: cron) that reruns the configured profile at a fixed time, independent of the GUI
 being open.
-
-## Building frozen releases
-
-Frozen builds bundle scdl, yt-dlp, mutagen, and the vendored bandcamp-downloader directly, so end
-users don't need Python or `pip install` at all.
-
-```bash
-pip install -r requirements.txt -r packaging/requirements-build.txt
-python packaging/build.py
-```
-
-This produces `dist/MultiMusicArchiver.app` on macOS, or a `dist/MultiMusicArchiver/` folder
-(containing `MultiMusicArchiver`/`MultiMusicArchiver.exe`) on Linux/Windows. PyInstaller can't
-cross-compile, so each platform's build has to actually run on that platform.
-
-[.github/workflows/build.yml](.github/workflows/build.yml) builds all three platforms on GitHub's
-own runners: push a `v*` tag to build and attach zipped builds to a GitHub Release, or trigger it
-manually (Actions tab → Build frozen releases → Run workflow) to just produce downloadable
-artifacts without releasing.
-
-Builds are unsigned -- macOS will require right-click → Open the first launch (Gatekeeper), and
-Windows will show a SmartScreen warning to click through.
 
 
