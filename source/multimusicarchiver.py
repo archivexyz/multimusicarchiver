@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import shlex
+import tempfile
 import textwrap
 import webbrowser
 import math
@@ -36,27 +37,11 @@ if platform.system() == "Windows":
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-LEGACY_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "scdl_gui")
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "multimusicarchiver", "settings.json")
 CONFIG_DIR = os.path.dirname(CONFIG_PATH)
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
 SCHEDULE_DIR = os.path.join(CONFIG_DIR, "schedules")
 
-
-def migrate_legacy_config_dir():
-    """One-time move of settings/schedules/logs from the old ~/.config/scdl_gui
-    directory (pre-rename) into the new ~/.config/multimusicarchiver location.
-    Registered OS-level daily schedules (Task Scheduler/launchd/cron) still
-    point at the old script path and need to be re-registered separately --
-    this only carries over saved settings and schedule profile files."""
-    if os.path.isdir(LEGACY_CONFIG_DIR) and not os.path.exists(CONFIG_DIR):
-        try:
-            shutil.move(LEGACY_CONFIG_DIR, CONFIG_DIR)
-        except OSError:
-            pass
-
-
-migrate_legacy_config_dir()
 NAME_FORMAT = "[%(id)s] %(uploader)s - %(title)s.%(ext)s"
 PLAYLIST_NAME_FORMAT = "%(playlist_index)s. [%(id)s] %(uploader)s - %(title)s.%(ext)s"
 BANDCAMP_FORMATS = ("mp3-320", "flac", "wav", "aiff-lossless", "alac", "aac-hi", "mp3-v0", "vorbis")
@@ -693,8 +678,12 @@ MP4_SOUNDCLOUD_ID_KEY = "----:com.apple.iTunes:SoundCloud ID"
 # Only the two shapes this app itself produces: "[id] uploader - title" and
 # "NN. [id] uploader - title" (playlist format). A free ".*?" prefix would
 # also claim unrelated files with bracketed numbers mid-name (barcodes,
-# other tools' rip ids) for tag-rewriting and renaming.
-FILENAME_ID_RE = re.compile(r"^(?P<prefix>\d+\.\s*)?\[(?P<id>\d{6,})\]\s*(?P<title>.+)$")
+# other tools' rip ids) for tag-rewriting and renaming. The id needs 7+
+# digits: every 6-digit run collides with YYMMDD date naming
+# ("[210415] Artist - Set.mp3") common in pre-existing libraries, and this
+# pass rewrites tags and renames what it claims. A hypothetical ancient
+# SoundCloud track with a shorter id merely goes unprocessed.
+FILENAME_ID_RE = re.compile(r"^(?P<prefix>\d+\.\s*)?\[(?P<id>\d{7,})\]\s*(?P<title>.+)$")
 AUDIO_EXTS = {".mp3", ".m4a", ".mp4", ".aac", ".flac", ".opus", ".ogg", ".wav"}
 
 
@@ -836,6 +825,7 @@ def read_track_id(path):
 mode = sys.argv[1]
 base = Path(sys.argv[2]).expanduser()
 archive_path = sys.argv[3] if len(sys.argv) > 3 else ""
+exclude_path = sys.argv[4] if len(sys.argv) > 4 else ""
 
 
 def read_allowed_ids(path):
@@ -860,19 +850,44 @@ def read_allowed_ids(path):
     return ids
 
 
+def read_exclude_paths(path):
+    # Absolute, normcased paths of files that already existed under the
+    # download folder *before* this run's download started. When no archive
+    # provides an ownership signal, this snapshot is what keeps the
+    # postprocess from tagging/renaming a pre-existing library: only files
+    # scdl actually created this run (absent from the snapshot) are touched.
+    paths = set()
+    if not path:
+        return paths
+    try:
+        with open(Path(path).expanduser(), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                entry = line.rstrip("\n")
+                if entry:
+                    paths.add(os.path.normcase(os.path.abspath(entry)))
+    except OSError:
+        pass
+    return paths
+
+
 # With an archive available, only files whose filename id it accounts for
 # are tagged/renamed: a pre-existing library can legitimately hold foreign
-# files with 6+ digit bracket prefixes (YYMMDD dates -- "[210415] Artist -
+# files with bracket-id prefixes (e.g. YYMMDD dates -- "[210415] Artist -
 # Set.mp3"), and rewriting their tags or names would corrupt data this app
 # doesn't own. scdl records every downloaded id in the archive (including
-# for already-present files), so app downloads always pass this gate. No
-# archive configured means no ownership signal; only then does the scan
-# fall back to claiming by filename shape alone.
+# for already-present files), so app downloads always pass this gate. With
+# no archive there is no id-level ownership signal, so the caller instead
+# passes a snapshot of the files that pre-existed the download, and only
+# files created this run are processed. Either way, a file this app didn't
+# just write is never modified.
 allowed_ids = read_allowed_ids(archive_path) if archive_path else None
+exclude_paths = read_exclude_paths(exclude_path)
 
 if mode == "postprocess":
     changed = []
     for path in audio_files_under(base):
+        if os.path.normcase(os.path.abspath(str(path))) in exclude_paths:
+            continue
         match = filename_id_match(path.stem)
         if not match:
             continue
@@ -929,8 +944,12 @@ def build_scdl_cmd(profile: dict) -> list[str]:
         cmd.append("-p")
 
     path = profile.get("path", "").strip()
-    if path:
-        cmd += ["--path", os.path.expanduser(path)]
+    if not path:
+        # Post-download processing rewrites tags and renames files under this
+        # folder, so it must never default to scdl's implicit working
+        # directory (a scheduled run's cwd is typically the home directory).
+        raise ValueError("Missing download folder. Set 'Save to' before downloading.")
+    cmd += ["--path", os.path.expanduser(path)]
 
     cmd += [
         "--name-format", NAME_FORMAT,
@@ -1031,11 +1050,13 @@ def build_bandcamp_cmd(profile: dict) -> list[str]:
         cmd.append("--summary")
     if profile.get("bandcamp_dry_run"):
         cmd.append("--dry-run")
-    if profile.get("bandcamp_verbose") or incremental_sync:
-        cmd.append("--verbose")
-    if incremental_sync:
-        # Need VERBOSE>=2 so the tool logs 'Album being saved to [...]' for
-        # every fresh download, which is how we detect the archive boundary.
+    # VERBOSE>=2 is required on *every* run, not just incremental syncs: the
+    # 'Album being saved to [...]' lines it enables are how each downloaded
+    # item id gets recorded, and the post-run scan refuses to touch any file
+    # whose id it can't prove this app downloaded (see
+    # process_bandcamp_downloads). They also drive archive-boundary detection.
+    cmd += ["--verbose", "--verbose"]
+    if profile.get("bandcamp_verbose"):
         cmd.append("--verbose")
 
     cmd.append(username)
@@ -1069,11 +1090,13 @@ def zip_probe(path: str) -> str:
         return "unknown"
 
 
-# Requires 6+ digits: real Bandcamp item ids have them, while short bracket
-# prefixes are common human naming conventions ("[1997] OK Computer.zip",
-# "[01] Intro.mp3") that the destructive post-scan must never claim as its
-# own. A hypothetical ancient item with a shorter id merely goes unprocessed.
-BANDCAMP_ITEM_NAME_RE = re.compile(r"^\[(?P<id>\d{6,})\]\s*(?P<label>.+)$")
+# Requires 7+ digits: real Bandcamp item ids have them, while shorter bracket
+# prefixes are common human naming conventions the destructive post-scan must
+# never claim as its own -- "[1997] OK Computer.zip", "[01] Intro.mp3", and
+# critically every YYMMDD date name ("[210415] Artist - Live Set.zip"), which
+# a 6-digit minimum would still match. A hypothetical ancient item with a
+# shorter id merely goes unprocessed.
+BANDCAMP_ITEM_NAME_RE = re.compile(r"^\[(?P<id>\d{7,})\]\s*(?P<label>.+)$")
 BANDCAMP_SAVE_LOG_RE = re.compile(r"Album being saved to \[(?P<path>.+)\]")
 BANDCAMP_DIRECT_AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".aiff", ".wav", ".ogg"}
 # Superset of the direct-download extensions: what may appear *inside* an
@@ -1169,7 +1192,23 @@ def unique_path(path: str) -> str:
     raise FileExistsError(f"No collision-free name available for {path}")
 
 
-def extract_zip_safely(zip_path: str, target_dir: str):
+def path_within_base(base: str, path: str) -> bool:
+    """Whether `path`, once every symlink in it is resolved, still lands
+    inside `base`. Used to refuse writes that a pre-existing directory
+    symlink (an artist folder, an album folder, a 'Singles' folder) would
+    otherwise redirect out of the user's selected download directory and on
+    top of unrelated files elsewhere on the machine. realpath() resolves a
+    non-existent leaf against its existing parent, so this is meaningful
+    even before the destination is created."""
+    try:
+        base_real = os.path.normcase(os.path.realpath(base))
+        path_real = os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return False
+    return path_real == base_real or path_real.startswith(base_real + os.sep)
+
+
+def extract_zip_safely(zip_path: str, target_dir: str, containment_base: str | None = None):
     """Extracts every member of zip_path into target_dir, sanitizing each
     path segment for Windows-illegal characters and dropping '..'/'.'
     segments (also closes the classic zip-slip path-traversal hole that
@@ -1177,7 +1216,18 @@ def extract_zip_safely(zip_path: str, target_dir: str):
     uniquified -- both between members (e.g. 'a?' and 'a*' mapping to 'a_')
     and against files already on disk, so extracting into a folder that
     already holds data (a pre-existing library organized the same way) can
-    never overwrite any of it."""
+    never overwrite any of it.
+
+    When `containment_base` is given, every destination is additionally
+    required to resolve (through any pre-existing symlinks) to a location
+    inside it; a member that would land outside -- because target_dir or one
+    of its components is a symlink pointing elsewhere -- is skipped rather
+    than followed out of the download directory."""
+    if containment_base is not None and not path_within_base(containment_base, target_dir):
+        raise ValueError(
+            f"Refusing to extract into {target_dir}: it resolves outside the download folder "
+            "(symlinked directory?)."
+        )
     os.makedirs(target_dir, exist_ok=True)
     claimed: set[str] = set()
 
@@ -1200,10 +1250,17 @@ def extract_zip_safely(zip_path: str, target_dir: str):
                 continue
             dest = os.path.join(target_dir, *(sanitize_windows_filename(p) for p in parts))
             if member.is_dir():
+                if containment_base is not None and not path_within_base(containment_base, dest):
+                    continue
                 os.makedirs(dest, exist_ok=True)
                 continue
             dest = claim(dest)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
+            # A symlinked intermediate component could still redirect the
+            # leaf outside the folder even though target_dir itself checked
+            # out -- verify the resolved parent before writing.
+            if containment_base is not None and not path_within_base(containment_base, os.path.dirname(dest)):
+                continue
             with archive.open(member) as source, open(dest, "wb") as target:
                 shutil.copyfileobj(source, target)
 
@@ -1308,12 +1365,14 @@ def bandcamp_item_conforms_to_layout(base: str, root: str, label: str) -> bool:
     """Whether a '[item_id] label' file under root sits exactly where this
     app's --filename-format ('{artist}/[{item_id}] {artist} - {title}')
     writes downloads: directly inside a first-level artist folder whose name
-    the label repeats. The bracket pattern alone is not proof of ownership
-    -- a pre-existing library can contain foreign files like
-    '[210415] Artist - Live Set.zip' (YYMMDD date naming) -- and the
-    post-run scan deletes/extracts/moves what it claims, so anything laid
-    out differently is left strictly alone. Files the downloader wrote
-    always conform by construction, wherever the user pointed 'Save to'."""
+    the label repeats. This is one of three independent gates the post-run
+    scan requires before touching a file -- the others are the 7+ digit
+    bracket id and proof the id was actually downloaded by this app (archive
+    or pending-claim record) -- because the scan deletes/extracts/moves what
+    it claims, and a pre-existing library organized as Base/Artist/ can hold
+    foreign files whose names alone look like ours. Files the downloader
+    wrote always conform by construction, wherever the user pointed
+    'Save to'."""
     parent = os.path.normcase(os.path.abspath(os.path.dirname(root)))
     if parent != os.path.normcase(os.path.abspath(base)):
         return False
@@ -1326,16 +1385,23 @@ def process_bandcamp_downloads(
     extract: bool,
     archive_ids: set[str] | None = None,
     archive_labels: dict[str, str] | None = None,
-) -> tuple[list[tuple[str, str]], int, list[str], str | None]:
+    claim_ids: set[str] | None = None,
+) -> tuple[list[tuple[str, str]], int, list[str], list[str], str | None]:
     """Scan a Bandcamp download folder after a run. Only files this app
-    downloaded are ever touched, and ownership requires both the
-    '[item_id] ' filename prefix our --filename-format produces *and* the
-    matching on-disk layout (bandcamp_item_conforms_to_layout); anything
-    else in the folder is left strictly alone. For owned files: delete any
-    structurally corrupted zip (ownership is already established by the
-    layout check, and zip_probe leaves anything it can't actually judge --
-    encrypted members, unsupported compression -- untouched rather than
-    misread as corrupt; the next sync simply re-downloads the item fresh),
+    downloaded are ever touched, and ownership requires all three of: the
+    '[item_id] ' filename prefix our --filename-format produces (7+ digit
+    id), the matching on-disk layout (bandcamp_item_conforms_to_layout),
+    and proof the id was downloaded by this app -- membership in
+    `claim_ids` (ids from the archive, from this run's 'Album being saved
+    to' lines, and from the pending-claim record of interrupted runs).
+    Anything else in the folder is left strictly alone, so pointing
+    'Save to' at a pre-existing library can never destroy or reorganize
+    files this app didn't create. For owned files: quarantine any
+    structurally corrupted zip by renaming it to '<name>.corrupt' rather
+    than deleting it -- the next sync re-downloads the item fresh, and the
+    bytes stay recoverable if the verdict was ever wrong (zip_probe already
+    leaves anything it can't actually judge -- encrypted members,
+    unsupported compression -- untouched rather than misread as corrupt),
     drop leftover .part staging files, and drop redundant re-downloads of
     items already in the archive -- but only once real output on disk backs
     that archive claim (for albums, an extracted folder actually containing
@@ -1357,16 +1423,20 @@ def process_bandcamp_downloads(
     the whole scan -- one bad album must never block every other album from
     being processed.
 
-    Returns (confirmed, extracted_count, removed, error_summary)."""
+    Returns (confirmed, extracted_count, removed, quarantined, error_summary)."""
     archive_ids = archive_ids or set()
     archive_labels = archive_labels or {}
+    # The archive is always proof of download; session/pending ids come in
+    # on top via the caller. An empty claim set means claim nothing.
+    claim_ids = (claim_ids or set()) | archive_ids
     base = os.path.expanduser(base_path)
     confirmed: list[tuple[str, str]] = []
     extracted_count = 0
     removed: list[str] = []
+    quarantined: list[str] = []
     errors: list[str] = []
     if not os.path.isdir(base):
-        return confirmed, extracted_count, removed, None
+        return confirmed, extracted_count, removed, quarantined, None
     for root, _, files in os.walk(base):
         for filename in files:
             stem, ext = os.path.splitext(filename)
@@ -1377,7 +1447,7 @@ def process_bandcamp_downloads(
                 # vendored downloader streams to '<name>.part' and renames on
                 # success). Only clean up ones this app owns.
                 parsed = parse_bandcamp_item_from_stem(os.path.splitext(stem)[0])
-                if parsed and bandcamp_item_conforms_to_layout(base, root, parsed[1]):
+                if parsed and parsed[0] in claim_ids and bandcamp_item_conforms_to_layout(base, root, parsed[1]):
                     try:
                         os.remove(path)
                     except OSError as err:
@@ -1387,8 +1457,12 @@ def process_bandcamp_downloads(
                 continue
             if ext == ".zip":
                 parsed = parse_bandcamp_item_from_stem(stem)
-                if not parsed or not bandcamp_item_conforms_to_layout(base, root, parsed[1]):
-                    # Not a zip this app downloaded -- leave it alone.
+                if (
+                    not parsed
+                    or parsed[0] not in claim_ids
+                    or not bandcamp_item_conforms_to_layout(base, root, parsed[1])
+                ):
+                    # No proof this app downloaded it -- leave it alone.
                     continue
                 if parsed[0] in archive_ids:
                     if not extract:
@@ -1414,19 +1488,21 @@ def process_bandcamp_downloads(
                     # a good archive, so leave it exactly as it is.
                     continue
                 if validity == "corrupt":
-                    # Structurally broken and owned by this app (layout check
-                    # above), so nothing of value is lost: remove it and let
-                    # the next sync re-download the item fresh.
+                    # Structurally broken and owned by this app (claim +
+                    # layout checks above). Quarantine rather than delete:
+                    # renaming it away from '.zip' makes the next sync
+                    # re-download the item fresh, while the bytes stay on
+                    # disk in case the corruption verdict was ever wrong.
                     try:
-                        os.remove(path)
+                        os.rename(path, unique_path(path + ".corrupt"))
                     except OSError as err:
                         errors.append(f"{filename}: {err}")
                         continue
-                    removed.append(path)
+                    quarantined.append(path)
                     continue
                 if extract:
                     try:
-                        extract_zip_safely(path, os.path.join(root, parsed[1]))
+                        extract_zip_safely(path, os.path.join(root, parsed[1]), containment_base=base)
                         os.remove(path)
                     except Exception as err:
                         errors.append(f"{filename}: {err}")
@@ -1442,6 +1518,9 @@ def process_bandcamp_downloads(
                 if not parsed:
                     continue
                 item_id, label = parsed
+                if item_id not in claim_ids:
+                    # No proof this app downloaded it -- leave it alone.
+                    continue
                 if not bandcamp_item_conforms_to_layout(base, root, label):
                     continue
                 singles_dir = os.path.join(root, "Singles")
@@ -1467,6 +1546,11 @@ def process_bandcamp_downloads(
                         continue
                 except OSError:
                     continue
+                if not path_within_base(base, singles_dir):
+                    # A pre-existing 'Singles' symlink would move the file out
+                    # of the download folder onto whatever it points at.
+                    errors.append(f"{filename}: 'Singles' resolves outside the download folder; skipped.")
+                    continue
                 try:
                     os.makedirs(singles_dir, exist_ok=True)
                     os.replace(path, unique_path(bandcamp_sorted_single_path(singles_dir, label, ext)))
@@ -1480,7 +1564,7 @@ def process_bandcamp_downloads(
         error_summary = "; ".join(shown)
         if len(errors) > len(shown):
             error_summary += f"; and {len(errors) - len(shown)} more"
-    return confirmed, extracted_count, removed, error_summary
+    return confirmed, extracted_count, removed, quarantined, error_summary
 
 
 def read_bandcamp_archive_ids(archive_path: str) -> set[str]:
@@ -1571,6 +1655,79 @@ def bandcamp_archive_labels_for_profile(profile: dict) -> dict[str, str]:
     return read_bandcamp_archive_labels(path)
 
 
+# ── Pending-claim tracking ───────────────────────────────────────────────────
+# The post-run scan only ever touches files whose item id it can prove this
+# app downloaded: ids already in the archive, ids seen in this run's 'Album
+# being saved to' lines, and ids recorded here from earlier runs. This file
+# (one per download folder, keyed by a hash of its path) is the persistence
+# for that proof: each id is appended the moment its download starts, so a
+# run killed between download and post-processing (app closed mid-run, power
+# loss) still leaves the id on record and the orphaned file gets processed by
+# the next run instead of sitting unclaimed forever. Ids are dropped again
+# once the archive accounts for them or their files were processed.
+PENDING_CLAIMS_DIR = os.path.join(CONFIG_DIR, "pending-claims")
+
+
+def pending_claims_path(base_path: str) -> str:
+    normalized = os.path.normcase(os.path.abspath(os.path.expanduser(base_path)))
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+    return os.path.join(PENDING_CLAIMS_DIR, f"{digest}.txt")
+
+
+def read_pending_claims(base_path: str) -> set[str]:
+    if not base_path:
+        return set()
+    ids: set[str] = set()
+    try:
+        with open(pending_claims_path(base_path), encoding="utf-8") as f:
+            for line in f:
+                entry = line.strip()
+                if entry:
+                    ids.add(entry)
+    except OSError:
+        pass
+    return ids
+
+
+def record_pending_claim(base_path: str, item_id: str):
+    """Best-effort by design: failing to record an id only means a file
+    orphaned by a killed run won't be auto-processed later -- it can never
+    cause a foreign file to be claimed."""
+    if not base_path or not item_id:
+        return
+    try:
+        os.makedirs(PENDING_CLAIMS_DIR, exist_ok=True)
+        with open(pending_claims_path(base_path), "a", encoding="utf-8") as f:
+            f.write(item_id + "\n")
+            f.flush()
+    except OSError:
+        pass
+
+
+def compact_pending_claims(base_path: str, done_ids: set[str]):
+    """Drops ids that no longer need claim tracking (processed this run or
+    now accounted for by the archive). Ids still awaiting processing -- e.g.
+    a downloaded zip whose extraction failed -- are kept so the next run can
+    claim them."""
+    if not base_path:
+        return
+    remaining = read_pending_claims(base_path) - done_ids
+    path = pending_claims_path(base_path)
+    try:
+        if not remaining:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        os.makedirs(PENDING_CLAIMS_DIR, exist_ok=True)
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            for item_id in sorted(remaining):
+                f.write(item_id + "\n")
+        os.replace(temp_path, path)
+    except OSError:
+        pass
+
+
 def append_bandcamp_archive(
     archive_path: str,
     confirmed: list[tuple[str, str]],
@@ -1646,6 +1803,7 @@ def terminate_process_tree(process: subprocess.Popen):
 
 def run_bandcamp_download(
     cmd: list[str],
+    base_path: str,
     archive_ids: set[str],
     archive_total: int | None,
     extract: bool = True,
@@ -1656,11 +1814,20 @@ def run_bandcamp_download(
     on_archive_check=None,
     on_archive_continue=None,
     on_archive_reprocess=None,
-) -> tuple[int, bool, list[tuple[str, str]]]:
-    """Runs bandcamp-downloader, streaming its output to `on_line`. If
-    `archive_ids` is non-empty (an incremental sync against an existing
-    archive), watches for the tool starting a fresh download of an album
-    that's already archived.
+) -> tuple[int, bool, list[tuple[str, str]], set[str]]:
+    """Runs bandcamp-downloader, streaming its output to `on_line`.
+
+    Every 'Album being saved to [...]' line's item id is collected into the
+    returned `saved_ids` and recorded in the pending-claim file for
+    `base_path` the moment the download starts -- this is the post-run
+    scan's proof that a file was downloaded by this app rather than being
+    pre-existing library data, and persisting it immediately means a run
+    killed before post-processing still leaves its files claimable by the
+    next run.
+
+    If `archive_ids` is non-empty (an incremental sync against an existing
+    archive), also watches for the tool starting a fresh download of an
+    album that's already archived.
 
     Bandcamp collections are newest-first, but "newest" means most recently
     *acquired*, not most recently released -- buying a discography bundle
@@ -1690,9 +1857,10 @@ def run_bandcamp_download(
     end. Each new item is counted once by id (retries re-log the same save
     line).
 
-    Returns (returncode, stopped_early, unavailable) where `unavailable` is
-    a list of (item_id, label) the caller should record as 'bandcamp-skip'
-    archive entries."""
+    Returns (returncode, stopped_early, unavailable, saved_ids) where
+    `unavailable` is a list of (item_id, label) the caller should record as
+    'bandcamp-skip' archive entries and `saved_ids` is every item id whose
+    download this run started."""
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         encoding="utf-8", errors="replace", env=child_process_env(),
@@ -1701,6 +1869,7 @@ def run_bandcamp_download(
         on_start(process)
     skip_ids = skip_ids or set()
     stopped_early = False
+    session_saved_ids: set[str] = set()
     session_new_ids: set[str] = set()
     session_unavailable_ids: set[str] = set()
     unavailable: list[tuple[str, str]] = []
@@ -1720,10 +1889,15 @@ def run_bandcamp_download(
                 session_unavailable_ids.add(item_id)
                 unavailable.append((item_id, unavailable_match.group("label").strip() or "unknown"))
             continue
-        if archive_ids and not stopped_early:
-            saved = bandcamp_item_from_save_line(line)
-            if saved:
-                item_id, save_path = saved
+        saved = bandcamp_item_from_save_line(line)
+        if saved:
+            item_id, save_path = saved
+            if item_id not in session_saved_ids:
+                session_saved_ids.add(item_id)
+                # Persist before more of the download lands on disk: this is
+                # what lets a later run claim the file if this one is killed.
+                record_pending_claim(base_path, item_id)
+            if archive_ids and not stopped_early:
                 in_archive = item_id in archive_ids
                 if on_archive_check:
                     on_archive_check(item_id, in_archive)
@@ -1750,7 +1924,7 @@ def run_bandcamp_download(
                 stopped_early = True
                 terminate_process_tree(process)
     process.wait()
-    return process.returncode, stopped_early, unavailable
+    return process.returncode, stopped_early, unavailable, session_saved_ids
 
 
 def redact_cmd(cmd: list[str]) -> list[str]:
@@ -1771,11 +1945,31 @@ def audio_base_path(profile: dict) -> str:
     return os.path.expanduser(path) if path else ""
 
 
+SCDL_AUDIO_EXTS = {".mp3", ".m4a", ".mp4", ".aac", ".flac", ".opus", ".ogg", ".wav"}
+
+
+def snapshot_existing_audio(base_path: str) -> set[str]:
+    """Absolute paths of every audio file already under `base_path`. Taken
+    before a download so the no-archive postprocess can tell files scdl just
+    wrote (safe to tag/rename) from a pre-existing library (must be left
+    untouched)."""
+    found: set[str] = set()
+    base = os.path.expanduser(base_path)
+    if not base or not os.path.isdir(base):
+        return found
+    for root, _, files in os.walk(base):
+        for name in files:
+            if os.path.splitext(name)[1].lower() in SCDL_AUDIO_EXTS:
+                found.add(os.path.abspath(os.path.join(root, name)))
+    return found
+
+
 def run_mp3_tag_helper(
     mode: str,
     base_path: str,
     profile: dict | None = None,
     archive_path: str = "",
+    exclude_paths: set[str] | None = None,
 ) -> tuple[object | None, str | None]:
     python = scdl_python_available(profile)
     if not python:
@@ -1784,20 +1978,38 @@ def run_mp3_tag_helper(
         helper_cmd = [sys.executable, "--mp3-tag-helper", mode, base_path]
     else:
         helper_cmd = [python, "-c", MP3_TAG_HELPER, mode, base_path]
-    if archive_path:
-        helper_cmd.append(archive_path)
+
+    exclude_file = None
     try:
-        result = subprocess.run(
-            helper_cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            encoding="utf-8",
-            errors="replace",
-            env=child_process_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return None, "Audio tag helper timed out."
+        if exclude_paths is not None:
+            # The exclude list occupies argv[4], so argv[3] (archive path)
+            # must be present even when empty to keep positions stable.
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            fd, exclude_file = tempfile.mkstemp(prefix="scdl-exclude-", suffix=".txt", dir=CONFIG_DIR)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for path in exclude_paths:
+                    f.write(path + "\n")
+            helper_cmd += [archive_path, exclude_file]
+        elif archive_path:
+            helper_cmd.append(archive_path)
+        try:
+            result = subprocess.run(
+                helper_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                encoding="utf-8",
+                errors="replace",
+                env=child_process_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return None, "Audio tag helper timed out."
+    finally:
+        if exclude_file:
+            try:
+                os.remove(exclude_file)
+            except OSError:
+                pass
 
     if result.returncode != 0:
         detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
@@ -1809,14 +2021,31 @@ def run_mp3_tag_helper(
         return None, "Audio tag helper returned invalid JSON."
 
 
-def postprocess_downloaded_mp3s(profile: dict) -> tuple[list[dict], str | None]:
+def postprocess_downloaded_mp3s(
+    profile: dict,
+    preexisting_audio: set[str] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Tag and rename the audio scdl just downloaded. Ownership is proven one
+    of two ways: with an archive, by the ids it records (allowed_ids in the
+    helper); without one, by `preexisting_audio` -- the set of files present
+    before the download, which the helper then refuses to touch (so only
+    files created this run are processed). An empty set is a valid snapshot
+    of a folder that had no audio beforehand, meaning every matched file is
+    new. `None` means the caller took no snapshot at all: with no ownership
+    signal, nothing is processed rather than claiming pre-existing files by
+    filename shape."""
     base = audio_base_path(profile)
     if not base:
         return [], "no download folder configured"
-    archive = ""
     if profile.get("use_archive"):
         archive = os.path.expanduser(str(profile.get("archive_path", "")).strip())
-    data, error = run_mp3_tag_helper("postprocess", base, profile, archive_path=archive)
+        data, error = run_mp3_tag_helper("postprocess", base, profile, archive_path=archive)
+    else:
+        if preexisting_audio is None:
+            return [], "no ownership signal (missing pre-download snapshot); skipped tagging"
+        data, error = run_mp3_tag_helper(
+            "postprocess", base, profile, exclude_paths=preexisting_audio
+        )
     return (data or []), error
 
 
@@ -2168,9 +2397,10 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
                 file=out, flush=True,
             )
 
-        rc, stopped_early, unavailable = run_bandcamp_download(
-            cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")), skip_ids,
-            archive_labels,
+        base_path = bandcamp_base_path(profile)
+        rc, stopped_early, unavailable, saved_ids = run_bandcamp_download(
+            cmd, base_path, archive_ids, archive_total, bool(profile.get("bandcamp_extract")),
+            skip_ids, archive_labels,
             on_line=on_line, on_archive_check=on_archive_check,
             on_archive_continue=on_archive_continue, on_archive_reprocess=on_archive_reprocess,
         )
@@ -2193,14 +2423,17 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
                         file=out, flush=True,
                     )
 
-        confirmed, extracted_count, removed, error = process_bandcamp_downloads(
-            bandcamp_base_path(profile), bool(profile.get("bandcamp_extract")), archive_ids,
-            archive_labels,
+        claim_ids = archive_ids | saved_ids | read_pending_claims(base_path)
+        confirmed, extracted_count, removed, quarantined, error = process_bandcamp_downloads(
+            base_path, bool(profile.get("bandcamp_extract")), archive_ids,
+            archive_labels, claim_ids,
         )
         if error:
             print(f"Zip processing failed: {error}", file=out, flush=True)
         if removed:
-            print(f"Removed {len(removed)} file(s) that were corrupted, incomplete, or redundant re-downloads backed by archived output on disk.", file=out, flush=True)
+            print(f"Removed {len(removed)} file(s) that were incomplete or redundant re-downloads backed by archived output on disk.", file=out, flush=True)
+        if quarantined:
+            print(f"Quarantined {len(quarantined)} corrupted zip file(s) by renaming them to '*.corrupt'; they will be re-downloaded on the next sync and can be deleted manually.", file=out, flush=True)
         if extracted_count:
             print(f"Extracted and removed {extracted_count} zip file(s).", file=out, flush=True)
         if profile.get("bandcamp_use_archive") and confirmed:
@@ -2209,6 +2442,14 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
                 added = append_bandcamp_archive(archive_path, confirmed)
                 if added:
                     print(f"Archived {added} newly confirmed album(s).", file=out, flush=True)
+        done_ids = {item_id for item_id, _ in confirmed}
+        if profile.get("bandcamp_use_archive"):
+            archive_path = os.path.expanduser(profile.get("bandcamp_archive_path", "").strip())
+            if archive_path:
+                # Re-read after the appends above so newly archived ids (and
+                # 'bandcamp-skip' entries) drop out of the pending record.
+                done_ids |= read_bandcamp_archive_ids(archive_path)
+        compact_pending_claims(base_path, done_ids)
         return rc
 
     cmd, note, finalize = prepare_download_cmd(profile)
@@ -2217,6 +2458,12 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
     if cmd is None:
         return 0
     print(shell_join(redact_cmd(cmd)), file=out, flush=True)
+    # Without an archive, ownership of downloaded files is proven by which
+    # files did NOT exist before this run, so snapshot before scdl runs.
+    preexisting_audio = (
+        None if profile.get("use_archive")
+        else snapshot_existing_audio(audio_base_path(profile))
+    )
     if log_stream:
         rc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=child_process_env()).returncode
     else:
@@ -2226,7 +2473,7 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
             finalize()
         except Exception as err:
             print(f"Archive session merge failed: {err}", file=out, flush=True)
-    changed, error = postprocess_downloaded_mp3s(profile)
+    changed, error = postprocess_downloaded_mp3s(profile, preexisting_audio)
     if error:
         print(f"Audio tag/rename skipped: {error}", file=out, flush=True)
     elif changed:
@@ -3895,7 +4142,7 @@ class ScdlApp(ctk.CTk):
         try:
             return build_scdl_cmd(self._current_profile())
         except ValueError as err:
-            messagebox.showerror("Missing archive path", str(err))
+            messagebox.showerror("SoundCloud download", str(err))
             return None
 
     def _current_profile(self) -> dict:
@@ -4197,6 +4444,14 @@ class ScdlApp(ctk.CTk):
                             self.after(0, lambda: self._on_done(0))
                             return
 
+                    # Without an archive, ownership of downloaded files is
+                    # proven by which files did NOT exist before this run, so
+                    # snapshot the folder before scdl writes anything.
+                    preexisting_audio = (
+                        None if profile.get("use_archive")
+                        else snapshot_existing_audio(audio_base_path(profile))
+                    )
+
                     self.after(0, lambda: self._set_status("Downloading…"))
                     self.after(0, lambda c=run_cmd: self._log(f"\n{'─'*60}\n▶  {' '.join(redact_cmd(c))}\n{'─'*60}\n"))
                     self._process = subprocess.Popen(
@@ -4219,7 +4474,7 @@ class ScdlApp(ctk.CTk):
                             finalize()
                         except Exception as merge_err:
                             self.after(0, lambda e=merge_err: self._log(f"⚠  Archive session merge failed: {e}\n", "warn"))
-                    changed, error = postprocess_downloaded_mp3s(profile)
+                    changed, error = postprocess_downloaded_mp3s(profile, preexisting_audio)
                     if error:
                         self.after(0, lambda e=error: self._log(f"⚠  Audio tag/rename skipped: {e}\n", "warn"))
                     elif changed:
@@ -4285,9 +4540,10 @@ class ScdlApp(ctk.CTk):
                         ),
                     )
 
-                returncode, stopped_early, unavailable = run_bandcamp_download(
-                    cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")), skip_ids,
-                    archive_labels,
+                base_path = bandcamp_base_path(profile)
+                returncode, stopped_early, unavailable, saved_ids = run_bandcamp_download(
+                    cmd, base_path, archive_ids, archive_total, bool(profile.get("bandcamp_extract")),
+                    skip_ids, archive_labels,
                     on_line=on_line, on_start=on_start,
                     on_archive_check=on_archive_check, on_archive_continue=on_archive_continue,
                     on_archive_reprocess=on_archive_reprocess,
@@ -4323,9 +4579,10 @@ class ScdlApp(ctk.CTk):
                                         "warn",
                                     ),
                                 )
-                    confirmed, extracted_count, removed, error = process_bandcamp_downloads(
-                        bandcamp_base_path(profile), bool(profile.get("bandcamp_extract")), archive_ids,
-                        archive_labels,
+                    claim_ids = archive_ids | saved_ids | read_pending_claims(base_path)
+                    confirmed, extracted_count, removed, quarantined, error = process_bandcamp_downloads(
+                        base_path, bool(profile.get("bandcamp_extract")), archive_ids,
+                        archive_labels, claim_ids,
                     )
                     if error:
                         self.after(0, lambda e=error: self._log(f"⚠  Zip processing failed: {e}\n", "warn"))
@@ -4333,7 +4590,16 @@ class ScdlApp(ctk.CTk):
                         self.after(
                             0,
                             lambda count=len(removed): self._log(
-                                f"Removed {count} file(s) that were corrupted, incomplete, or redundant re-downloads backed by archived output on disk.\n",
+                                f"Removed {count} file(s) that were incomplete or redundant re-downloads backed by archived output on disk.\n",
+                                "warn",
+                            ),
+                        )
+                    if quarantined:
+                        self.after(
+                            0,
+                            lambda count=len(quarantined): self._log(
+                                f"Quarantined {count} corrupted zip file(s) by renaming them to '*.corrupt'; "
+                                "they will be re-downloaded on the next sync and can be deleted manually.\n",
                                 "warn",
                             ),
                         )
@@ -4355,6 +4621,15 @@ class ScdlApp(ctk.CTk):
                                         f"Archived {count} newly confirmed album(s).\n", "ok"
                                     ),
                                 )
+                    done_ids = {item_id for item_id, _ in confirmed}
+                    if profile.get("bandcamp_use_archive"):
+                        archive_path = os.path.expanduser(profile.get("bandcamp_archive_path", "").strip())
+                        if archive_path:
+                            # Re-read after the appends above so newly archived
+                            # ids (and 'bandcamp-skip' entries) drop out of the
+                            # pending record.
+                            done_ids |= read_bandcamp_archive_ids(archive_path)
+                    compact_pending_claims(base_path, done_ids)
                 self.after(0, lambda: self._on_done(rc))
             except FileNotFoundError:
                 self.after(0, lambda: self._log("Downloader not found. Install the selected downloader first.\n", "error"))
@@ -4469,9 +4744,6 @@ class ScdlApp(ctk.CTk):
         if "use_archive" in c:
             self.use_archive.set(c["use_archive"])
             self.skip_existing.set(c["use_archive"])
-        elif "skip_existing" in c:
-            self.skip_existing.set(c["skip_existing"])
-            self.use_archive.set(c["skip_existing"])
         if "only_mp3" in c:
             self.only_mp3.set(c["only_mp3"])
         if "flac" in c:

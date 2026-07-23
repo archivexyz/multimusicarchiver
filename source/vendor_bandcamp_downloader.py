@@ -197,9 +197,8 @@ def main() -> int:
     parser.add_argument(
         '--extract', '-x',
         action='store_true',
-        help='Extracts downloaded albums, organised in {ARTIST}/{ALBUM} subdirectories. Songs are extracted to the '
-             'path specified in the `--directory`/`-d` flag, otherwise to the current directory if not specified. '
-             'Upon completion, original .zip file is deleted.'
+        help='DISABLED in this vendored copy. The GUI wrapper extracts downloaded albums safely on its '
+             'own; the upstream implementation here used an unsafe zip extraction and has been removed.'
     )
     parser.add_argument(
         '--dry-run',
@@ -215,6 +214,13 @@ def main() -> int:
     )
     parser.add_argument('--verbose', '-v', action='count', default = 0)
     args = parser.parse_args()
+
+    # Local modification: --extract is disabled. Its upstream implementation
+    # used ZipFile.extractall (zip-slip traversal, silent overwrite of
+    # existing files) and a fragile album-name regex; the GUI wrapper handles
+    # extraction safely instead. Fail loudly rather than silently ignoring it.
+    if args.extract:
+        parser.error('--extract is disabled in this vendored copy; extraction is handled by the wrapper.')
 
     if args.parallel_downloads < 1 or args.parallel_downloads > MAX_THREADS:
         parser.error('--parallel-downloads must be between 1 and 32.')
@@ -279,19 +285,14 @@ def main() -> int:
             download_and_log_album(album)
     CONFIG['TQDM'].close()
 
-    if args.extract:
-        downloaded_zips = [item['file_path'] + '.zip' for item in items.values() if item['extension'] == '.zip' and item['downloaded']]
-        if CONFIG['VERBOSE'] >=2:
-            print(downloaded_zips)
-        for zip in downloaded_zips:
-            print(f'Extracting compressed archive: {zip}')
-            if CONFIG['DRY_RUN']: continue
-            album_name = re.search(r'\- (.+?)\.zip$', zip).group(1)
-            extract_dir = os.path.join(os.path.dirname(zip), album_name)
-            with zipfile.ZipFile(zip, 'r') as zip_file:
-                zip_file.extractall(extract_dir)
-            os.remove(zip)
-
+    # Local modification: the upstream --extract implementation is disabled
+    # in this vendored copy (see the --extract argument and the parser.error
+    # guard in main()). It used ZipFile.extractall, which follows zip-slip
+    # traversal entries and silently overwrites colliding files already on
+    # disk, and derived the album folder with a regex that crashed on any
+    # filename lacking ' - '. The GUI wrapper performs extraction itself via
+    # extract_zip_safely(), which sanitizes members, refuses to escape the
+    # download folder, and never overwrites existing files.
 
     FAILED_STATUSES=['Error', 'Exception', 'Unavailable']
     if CONFIG['VERBOSE']:
@@ -649,6 +650,12 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
                 _album['download_status'] = 'Skipped'
                 return False
 
+        # Local modification: refuse to write through a symlinked directory
+        # that would place the file outside the selected download folder.
+        if not _within_output_dir(file_path):
+            CONFIG['TQDM'].write('WARN: refusing to save [{}] -- it resolves outside the download directory (symlinked path?).'.format(file_path))
+            _album['download_status'] = 'Error'
+            return False
         if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album being saved to [{}]'.format(file_path))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         # Local modification: stream to a '.part' file and only move it into
@@ -763,6 +770,19 @@ def get_cookies():
 def _is_zip(file_path: str) -> bool:
     # Determine if the file is a compressed .zip archive
     return file_path.endswith('.zip') if file_path else False
+
+# Local modification: whether the (possibly not-yet-created) destination
+# resolves, through any pre-existing symlinks, to a location still inside the
+# configured download directory. A pre-existing artist folder that is a
+# symlink to somewhere else would otherwise make os.makedirs()/os.replace()
+# write the download on top of unrelated files outside OUTPUT_DIR.
+def _within_output_dir(_file_path : str) -> bool:
+    try:
+        base_real = os.path.normcase(os.path.realpath(CONFIG['OUTPUT_DIR']))
+        parent_real = os.path.normcase(os.path.realpath(os.path.dirname(_file_path)))
+    except OSError:
+        return False
+    return parent_real == base_real or parent_real.startswith(base_real + os.sep)
 
 
 if __name__ == '__main__':
