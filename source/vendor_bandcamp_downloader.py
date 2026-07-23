@@ -2,6 +2,14 @@
 pinned to commit 5c695c837f1dbd00856ec6cdbfad076982d408c4, so it can be imported directly and
 bundled into frozen builds instead of relying on an externally pip-installed copy.
 
+Local modifications from upstream (marked inline with "Local modification"):
+  * download_file() streams to a '<name>.part' file and os.replace()s it into
+    place only after the size check passes, so an interrupted download can
+    never truncate or corrupt a file at the final path.
+  * The verbose 'Found [N] downloadable items' line is printed after
+    --download-since/--download-until filtering, so N matches the number of
+    items the run will actually iterate (the GUI wrapper parses this line).
+
 bandcamp-downloader is distributed under the MIT License:
 
 MIT License
@@ -231,8 +239,6 @@ def main() -> int:
     if not items:
         print('WARN: No album links found for user [{}]. Are you logged in and have you selected the correct browser to pull cookies from?'.format(args.username))
         sys.exit(2)
-    if CONFIG['VERBOSE']: print('Found [{}] downloadable items in [{}]\'s collection.'.format(len(items), args.username))
-
     if CONFIG['SINCE'] or CONFIG['UNTIL']:
         # Filter items by purchase time
         items = {key: items[key] for key in items
@@ -243,6 +249,11 @@ def main() -> int:
 
         if CONFIG['VERBOSE']:
             print('[{}] album links purchased since (including) [{}] until [{}] (excluding).'.format(len(items), CONFIG['SINCE'], CONFIG['UNTIL']))
+
+    # Local modification: report the count *after* date filtering so it
+    # reflects the number of items this run will actually iterate (the GUI
+    # wrapper parses this exact line for its archive-boundary accounting).
+    if CONFIG['VERBOSE']: print('Found [{}] downloadable items in [{}]\'s collection.'.format(len(items), args.username))
 
     print('Starting album downloads...')
     CONFIG['TQDM'] = tqdm(items, unit = 'album')
@@ -586,12 +597,22 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
 
         if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album being saved to [{}]'.format(file_path))
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, 'wb') as fh:
+        # Local modification: stream to a '.part' file and only move it into
+        # place once the byte count checks out, so an interrupted or
+        # incomplete download can never truncate or replace a good existing
+        # file at the final path.
+        part_path = file_path + '.part'
+        with open(part_path, 'wb') as fh:
             for chunk in response.iter_content():
                 fh.write(chunk)
             actual_size = fh.tell()
         if expected_size != actual_size:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
             raise IOError('Incomplete read. {} bytes read, {} bytes expected'.format(actual_size, expected_size))
+        os.replace(part_path, file_path)
         _album['download_status'] = 'Downloaded'
         return True
     except IOError as e:

@@ -67,9 +67,16 @@ jobs:
 
       - name: Zip artifact
         shell: bash
+        # Git Bash on the Windows runners has no `zip`; use the preinstalled
+        # 7-Zip there. On macOS keep zip -y so the .app bundle's internal
+        # symlinks are stored as symlinks instead of being duplicated.
         run: |
           cd "$(dirname "${{ matrix.build_path }}")"
-          zip -r -y "${{ matrix.artifact_name }}.zip" "$(basename "${{ matrix.build_path }}")"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${{ matrix.artifact_name }}.zip" "$(basename "${{ matrix.build_path }}")"
+          else
+            zip -r -y "${{ matrix.artifact_name }}.zip" "$(basename "${{ matrix.build_path }}")"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
