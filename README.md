@@ -7,7 +7,7 @@ library from either service, with optional daily scheduling and deleted track ch
 ## ⚠️ Safety Notice
 I am not a developer and almost all of the code in this program is written by an LLM. Accordingly, 
 this program can only delete / overwrite files that itself downloaded or are identical to files it
-is downloading (exact name, layout, and bandcamp item id). If you want to be *absolutely certain* of no data
+is downloading (exact name, layout, and Bandcamp id in its filename). If you want to be *absolutely certain* of no data
 loss, point the save directories to fresh folders.
 
 ## Download
