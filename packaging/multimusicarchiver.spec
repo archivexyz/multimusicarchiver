@@ -21,7 +21,15 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 REPO_ROOT = Path(SPECPATH).resolve().parent
 SOURCE_DIR = REPO_ROOT / "source"
 
-datas = collect_data_files("customtkinter")
+datas = (
+    collect_data_files("customtkinter")
+    # scdl._get_config() reads scdl/scdl.cfg (a non-.py package data file, next
+    # to scdl.py) as the default config template on every run. collect_submodules
+    # below only pulls in scdl's Python modules, not this file, so without it
+    # the frozen app crashes with FileNotFoundError the first time --run-scdl
+    # executes.
+    + collect_data_files("scdl")
+)
 
 hiddenimports = (
     # Only referenced from inside exec()'d helper-script string constants
