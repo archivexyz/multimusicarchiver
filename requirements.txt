@@ -1,0 +1,8 @@
+customtkinter
+scdl
+yt-dlp
+mutagen
+
+# Not on PyPI; installed from source. The app can also install this
+# itself via its "Install Bandcamp" button.
+bandcamp-downloader @ git+https://github.com/easlice/bandcamp-downloader.git

@@ -25,7 +25,7 @@ import webbrowser
 import math
 import zipfile
 import urllib.request
-from tkinter import filedialog, messagebox, simpledialog, Text
+from tkinter import filedialog, messagebox, simpledialog, Menu, Text
 from datetime import datetime
 
 if platform.system() == "Windows":
@@ -2164,14 +2164,40 @@ class TimePicker(ctk.CTkFrame):
     def _toggle_dropdown(self):
         if self._state == "disabled":
             return
+        if platform.system() == "Darwin":
+            # Opening already happens on ButtonPress via _open_for_drag; tk_popup()
+            # holds its own grab until dismissed, so this (fired on ButtonRelease)
+            # would otherwise re-open the just-closed menu. See _open_native_menu.
+            return
         if self._dropdown is not None and self._dropdown.winfo_exists():
             self._close_dropdown()
         else:
             self._open_dropdown()
 
     def _open_for_drag(self, _event=None):
-        if self._state != "disabled":
+        if self._state == "disabled":
+            return
+        if platform.system() == "Darwin":
+            self._open_native_menu()
+        else:
             self._open_dropdown()
+
+    def _open_native_menu(self):
+        """A borderless custom Toplevel (what _open_dropdown below uses) is
+        unreliable to click on macOS -- Tk/Aqua doesn't always hit-test a newly
+        mapped override-redirect window under a stationary cursor, so clicks on
+        its rows can silently do nothing. Tk's own ttk::combobox sidesteps this
+        on Aqua by posting a native menu instead of a custom popup; do the same
+        here rather than fighting Tk's override-redirect click handling."""
+        menu = Menu(self, tearoff=0)
+        for value in self._values:
+            menu.add_command(label=value, command=lambda v=value: self._select_value(v))
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     def _open_dropdown(self):
         if self._dropdown is not None and self._dropdown.winfo_exists():
@@ -2272,7 +2298,7 @@ class ScdlApp(ctk.CTk):
         super().__init__()
 
         self.title("Multi Music Archiver")
-        self.geometry("920x820")
+        self.geometry("950x820")
         self.minsize(800, 620)
         self.resizable(True, True)
 
@@ -2404,7 +2430,7 @@ class ScdlApp(ctk.CTk):
         ctk.CTkLabel(auth_label, text="Auth token", width=85, anchor="e").pack(side="left")
         self.token_entry = ctk.CTkEntry(
             top,
-            placeholder_text="OAuth token: needed for original files, likes/me, HQ downloads with GO+",
+            placeholder_text="OAuth token: needed for original files, HQ downloads with GO+",
             show="•",
         )
         self.token_entry.grid(row=2, column=1, sticky="ew", pady=4)
@@ -2524,37 +2550,38 @@ class ScdlApp(ctk.CTk):
         self.skip_existing = ctk.BooleanVar(value=True)
         self.skip_existing_btn = ctk.CTkCheckBox(opts, text="Skip existing files  (-c)", variable=self.skip_existing,
                                                  command=self._toggle_skip_existing)
-        self.skip_existing_btn.grid(row=9, column=0, sticky="w", padx=12, pady=2)
+        self.skip_existing_btn.grid(row=9, column=0, columnspan=4, sticky="w", padx=12, pady=2)
+
         self.use_archive_btn = ctk.CTkCheckBox(opts, text="Use archive file", variable=self.use_archive,
                                                command=self._toggle_archive)
-        self.use_archive_btn.grid(row=9, column=1, sticky="w", padx=12, pady=2)
+        self.use_archive_btn.grid(row=10, column=0, sticky="w", padx=12, pady=2)
 
-        self.archive_entry = ctk.CTkEntry(opts, placeholder_text="archive.txt path")
-        self.archive_entry.grid(row=9, column=2, sticky="ew", padx=(0, 6), pady=2)
+        self.archive_entry = ctk.CTkEntry(opts, placeholder_text="sc-archive.txt path")
+        self.archive_entry.grid(row=10, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=2)
         self.archive_browse_btn = ctk.CTkButton(opts, text="Browse…", width=80,
                                                 command=self._pick_archive)
-        self.archive_browse_btn.grid(row=9, column=3, padx=(0, 12), pady=2)
+        self.archive_browse_btn.grid(row=10, column=3, padx=(0, 12), pady=2)
 
         # ── Schedule row ──
         sep3 = ctk.CTkFrame(opts, height=1, fg_color=("gray80", "gray30"))
-        sep3.grid(row=10, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
+        sep3.grid(row=11, column=0, columnspan=4, sticky="ew", padx=8, pady=6)
 
         ctk.CTkLabel(opts, text="Daily schedule", font=ctk.CTkFont(weight="bold")).grid(
-            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
+            row=12, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 2))
 
         self.enable_schedule = ctk.BooleanVar()
         self.enable_schedule_btn = ctk.CTkCheckBox(opts, text="Run daily at", variable=self.enable_schedule,
                                                    command=self._toggle_schedule)
-        self.enable_schedule_btn.grid(row=12, column=0, sticky="w", padx=12, pady=(2, 8))
+        self.enable_schedule_btn.grid(row=13, column=0, sticky="w", padx=12, pady=(2, 8))
         self.schedule_hour = TimePicker(opts, values=[f"{h:02d}" for h in range(24)], width=70, state="disabled")
         self.schedule_hour.set("08")
-        self.schedule_hour.grid(row=12, column=1, sticky="w", padx=(0, 4), pady=(2, 8))
-        ctk.CTkLabel(opts, text=":").grid(row=12, column=1, padx=(74, 0), sticky="w")
+        self.schedule_hour.grid(row=13, column=1, sticky="w", padx=(0, 4), pady=(2, 8))
+        ctk.CTkLabel(opts, text=":").grid(row=13, column=1, padx=(74, 0), sticky="w")
         self.schedule_min = TimePicker(opts, values=["00", "15", "30", "45"], width=70, state="disabled")
         self.schedule_min.set("00")
-        self.schedule_min.grid(row=12, column=2, sticky="w", pady=(2, 8))
+        self.schedule_min.grid(row=13, column=2, sticky="w", pady=(2, 8))
         schedule_actions = ctk.CTkFrame(opts, fg_color="transparent")
-        schedule_actions.grid(row=12, column=3, sticky="e", padx=12, pady=(2, 8))
+        schedule_actions.grid(row=13, column=3, sticky="e", padx=12, pady=(2, 8))
         self.schedule_btn = ctk.CTkButton(schedule_actions, text="Register schedule", width=140,
                                           command=self._register_schedule, state="disabled")
         self.schedule_btn.pack(side="left")
@@ -2643,7 +2670,7 @@ class ScdlApp(ctk.CTk):
         )
         self.bandcamp_use_archive_btn.grid(row=10, column=0, sticky="w", padx=12, pady=2)
 
-        self.bandcamp_archive_entry = ctk.CTkEntry(bandcamp_opts, placeholder_text="archive.txt path")
+        self.bandcamp_archive_entry = ctk.CTkEntry(bandcamp_opts, placeholder_text="bc-archive.txt path")
         self.bandcamp_archive_entry.grid(row=10, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=2)
         self.bandcamp_archive_browse_btn = ctk.CTkButton(bandcamp_opts, text="Browse…", width=80,
                                                          command=self._pick_bandcamp_archive)
@@ -3145,6 +3172,39 @@ class ScdlApp(ctk.CTk):
         except Exception as err:
             messagebox.showerror("Schedule logs", str(err))
 
+    def _make_tooltip_window(self, x: int, y: int) -> ctk.CTkToplevel:
+        """Bare tooltip Toplevel, styled per idlelib.tooltip's proven cross-platform
+        recipe: without the MacWindowStyle call, popups like this render fully blank
+        on macOS (the OS never paints an overrideredirect window it also treats as a
+        normal, activatable one); without update_idletasks()+lift() afterwards, the
+        content can still fail to paint or can appear behind the main window."""
+        tooltip = ctk.CTkToplevel(self)
+        tooltip.overrideredirect(True)
+        tooltip.geometry(f"+{max(x, 0)}+{y}")
+        tooltip.attributes("-topmost", True)
+        try:
+            tooltip.tk.call("::tk::unsupported::MacWindowStyle", "style", tooltip._w, "help", "noActivates")
+        except Exception:
+            pass
+        return tooltip
+
+    def _finalize_tooltip_window(self, tooltip: ctk.CTkToplevel):
+        tooltip.update_idletasks()
+        tooltip.lift()
+
+    def _pointer_over_tooltip(self, tooltip: ctk.CTkToplevel | None) -> bool:
+        if tooltip is None or not tooltip.winfo_exists():
+            return False
+        try:
+            px, py = tooltip.winfo_pointerxy()
+        except Exception:
+            return False
+        if px < 0 or py < 0:
+            return False
+        x1 = tooltip.winfo_rootx()
+        y1 = tooltip.winfo_rooty()
+        return x1 <= px < x1 + tooltip.winfo_width() and y1 <= py < y1 + tooltip.winfo_height()
+
     def _show_auth_tooltip(self, _event=None):
         if self._auth_tooltip_hide_after is not None:
             self.after_cancel(self._auth_tooltip_hide_after)
@@ -3154,10 +3214,7 @@ class ScdlApp(ctk.CTk):
 
         x = self.auth_help.winfo_rootx() - 30
         y = self.auth_help.winfo_rooty() + 28
-        tooltip = ctk.CTkToplevel(self)
-        tooltip.overrideredirect(True)
-        tooltip.geometry(f"+{max(x, 0)}+{y}")
-        tooltip.attributes("-topmost", True)
+        tooltip = self._make_tooltip_window(x, y)
         label = ctk.CTkLabel(
             tooltip,
             text=(
@@ -3165,18 +3222,19 @@ class ScdlApp(ctk.CTk):
                 "console (press F12) and going to the Storage tab. Then under cookies > soundcloud.com "
                 "you can find the entry called oauth_token."
             ),
-            wraplength=420,
+            wraplength=340,
             justify="left",
             fg_color=("gray95", "gray20"),
             text_color=("gray10", "gray95"),
             corner_radius=6,
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=13),
         )
         label.pack(ipadx=10, ipady=7)
         tooltip.bind("<Enter>", self._show_auth_tooltip)
         tooltip.bind("<Leave>", self._hide_auth_tooltip)
         label.bind("<Enter>", self._show_auth_tooltip)
         label.bind("<Leave>", self._hide_auth_tooltip)
+        self._finalize_tooltip_window(tooltip)
         self._auth_tooltip = tooltip
 
     def _hide_auth_tooltip(self, _event=None):
@@ -3185,9 +3243,18 @@ class ScdlApp(ctk.CTk):
         self._auth_tooltip_hide_after = self.after(180, self._destroy_auth_tooltip)
 
     def _destroy_auth_tooltip(self):
+        tooltip = self._auth_tooltip
+        if self._pointer_over_tooltip(tooltip):
+            # <Enter>/<Leave> on this borderless "help"-style popup don't fire
+            # reliably on macOS, so re-check the actual pointer position rather
+            # than trusting them -- otherwise hovering onto the tooltip (e.g. to
+            # click a hyperlink inside it) gets it destroyed out from under the
+            # cursor.
+            self._auth_tooltip_hide_after = self.after(180, self._destroy_auth_tooltip)
+            return
         self._auth_tooltip_hide_after = None
-        if self._auth_tooltip is not None and self._auth_tooltip.winfo_exists():
-            self._auth_tooltip.destroy()
+        if tooltip is not None and tooltip.winfo_exists():
+            tooltip.destroy()
         self._auth_tooltip = None
 
     def _show_bandcamp_cookies_tooltip(self, _event=None):
@@ -3199,10 +3266,7 @@ class ScdlApp(ctk.CTk):
 
         x = self.bandcamp_cookies_help.winfo_rootx() - 30
         y = self.bandcamp_cookies_help.winfo_rooty() + 28
-        tooltip = ctk.CTkToplevel(self)
-        tooltip.overrideredirect(True)
-        tooltip.geometry(f"+{max(x, 0)}+{y}")
-        tooltip.attributes("-topmost", True)
+        tooltip = self._make_tooltip_window(x, y)
 
         frame = ctk.CTkFrame(tooltip, fg_color=("gray95", "gray20"), corner_radius=6)
         frame.pack()
@@ -3210,12 +3274,12 @@ class ScdlApp(ctk.CTk):
             frame,
             wrap="word",
             width=54,
-            height=6,
+            height=1,
             borderwidth=0,
             highlightthickness=0,
             background="gray20",
             foreground="gray95",
-            font=("TkDefaultFont", 12),
+            font=("TkDefaultFont", -13),
             cursor="arrow",
             padx=10,
             pady=7,
@@ -3231,11 +3295,14 @@ class ScdlApp(ctk.CTk):
         text_widget.tag_bind("hyperlink", "<Leave>", lambda _e: text_widget.configure(cursor="arrow"))
         text_widget.configure(state="disabled")
         text_widget.pack()
+        text_widget.update_idletasks()
+        text_widget.configure(height=text_widget.count("1.0", "end", "displaylines")[0])
 
         tooltip.bind("<Enter>", self._show_bandcamp_cookies_tooltip)
         tooltip.bind("<Leave>", self._hide_bandcamp_cookies_tooltip)
         text_widget.bind("<Enter>", self._show_bandcamp_cookies_tooltip)
         text_widget.bind("<Leave>", self._hide_bandcamp_cookies_tooltip)
+        self._finalize_tooltip_window(tooltip)
         self._bandcamp_cookies_tooltip = tooltip
 
     def _hide_bandcamp_cookies_tooltip(self, _event=None):
@@ -3244,9 +3311,13 @@ class ScdlApp(ctk.CTk):
         self._bandcamp_cookies_tooltip_hide_after = self.after(180, self._destroy_bandcamp_cookies_tooltip)
 
     def _destroy_bandcamp_cookies_tooltip(self):
+        tooltip = self._bandcamp_cookies_tooltip
+        if self._pointer_over_tooltip(tooltip):
+            self._bandcamp_cookies_tooltip_hide_after = self.after(180, self._destroy_bandcamp_cookies_tooltip)
+            return
         self._bandcamp_cookies_tooltip_hide_after = None
-        if self._bandcamp_cookies_tooltip is not None and self._bandcamp_cookies_tooltip.winfo_exists():
-            self._bandcamp_cookies_tooltip.destroy()
+        if tooltip is not None and tooltip.winfo_exists():
+            tooltip.destroy()
         self._bandcamp_cookies_tooltip = None
 
     def _entry_value(self, entry: ctk.CTkEntry) -> str:
@@ -3315,24 +3386,27 @@ class ScdlApp(ctk.CTk):
 
         x = self.archive_scan_help.winfo_rootx() - 340
         y = self.archive_scan_help.winfo_rooty() - 48
-        tooltip = ctk.CTkToplevel(self)
-        tooltip.overrideredirect(True)
-        tooltip.geometry(f"+{max(x, 0)}+{y}")
-        tooltip.attributes("-topmost", True)
+        tooltip = self._make_tooltip_window(x, y)
         label = ctk.CTkLabel(
             tooltip,
-            text="Checks for deleted tracks from the archive file against tracks in the archive directory",
+            text=(
+                "Checks whether SoundCloud track IDs are still available online "
+                "and reports which have been deleted or made private, along "
+                "with any local copies you still have of them. "
+            ),
             wraplength=340,
             justify="left",
             fg_color=("gray95", "gray20"),
             text_color=("gray10", "gray95"),
             corner_radius=6,
+            font=ctk.CTkFont(size=13),
         )
         label.pack(ipadx=10, ipady=7)
         tooltip.bind("<Enter>", self._show_scan_tooltip)
         tooltip.bind("<Leave>", self._hide_scan_tooltip)
         label.bind("<Enter>", self._show_scan_tooltip)
         label.bind("<Leave>", self._hide_scan_tooltip)
+        self._finalize_tooltip_window(tooltip)
         self._scan_tooltip = tooltip
 
     def _hide_scan_tooltip(self, _event=None):
@@ -3341,9 +3415,13 @@ class ScdlApp(ctk.CTk):
         self._scan_tooltip_hide_after = self.after(180, self._destroy_scan_tooltip)
 
     def _destroy_scan_tooltip(self):
+        tooltip = self._scan_tooltip
+        if self._pointer_over_tooltip(tooltip):
+            self._scan_tooltip_hide_after = self.after(180, self._destroy_scan_tooltip)
+            return
         self._scan_tooltip_hide_after = None
-        if self._scan_tooltip is not None and self._scan_tooltip.winfo_exists():
-            self._scan_tooltip.destroy()
+        if tooltip is not None and tooltip.winfo_exists():
+            tooltip.destroy()
         self._scan_tooltip = None
 
     def _pick_folder(self):
@@ -3405,7 +3483,7 @@ class ScdlApp(ctk.CTk):
             title="Create Bandcamp cookies file",
             defaultextension=".txt",
             filetypes=[("Cookies text files", "*.txt"), ("All files", "*.*")],
-            initialfile="cookies.txt",
+            initialfile="bandcamp-cookies.txt",
         )
         if path:
             if not os.path.exists(path):
@@ -3418,7 +3496,7 @@ class ScdlApp(ctk.CTk):
             path = filedialog.askopenfilename(
                 title="Select Netscape cookies.txt file",
                 filetypes=[("Cookies text files", "*.txt"), ("All files", "*.*")],
-                initialfile="cookies.txt",
+                initialfile="bandcamp-cookies.txt",
             )
             if path:
                 self._set_entry_value(self.bandcamp_cookies_entry, path)
@@ -3455,13 +3533,13 @@ class ScdlApp(ctk.CTk):
             title="Create archive file",
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile="archive.txt",
+            initialfile="sc-archive.txt",
         )
         if not path and messagebox.askyesno("Select existing archive file?", "Select an existing archive.txt file instead?"):
             path = filedialog.askopenfilename(
                 title="Select archive file",
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-                initialfile="archive.txt",
+                initialfile="sc-archive.txt",
             )
         if path:
             if not os.path.exists(path):
@@ -3473,13 +3551,13 @@ class ScdlApp(ctk.CTk):
             title="Create archive file",
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile="archive.txt",
+            initialfile="bc-archive.txt",
         )
         if not path and messagebox.askyesno("Select existing archive file?", "Select an existing archive.txt file instead?"):
             path = filedialog.askopenfilename(
                 title="Select archive file",
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-                initialfile="archive.txt",
+                initialfile="bc-archive.txt",
             )
         if path:
             if not os.path.exists(path):
@@ -3488,9 +3566,11 @@ class ScdlApp(ctk.CTk):
 
     def _log(self, text: str, kind: str = "info"):
         colors = {"info": None, "warn": "orange", "error": "red", "ok": "lightgreen"}
+        stick_to_bottom = self.log_box.yview()[1] >= 0.999
         self.log_box.configure(state="normal")
         self.log_box.insert("end", text)
-        self.log_box.see("end")
+        if stick_to_bottom:
+            self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
     def _set_archive_text(self, text: str):
@@ -3501,9 +3581,11 @@ class ScdlApp(ctk.CTk):
         self.archive_box.configure(state="disabled")
 
     def _append_archive_text(self, text: str):
+        stick_to_bottom = self.archive_box.yview()[1] >= 0.999
         self.archive_box.configure(state="normal")
         self.archive_box.insert("end", text)
-        self.archive_box.see("end")
+        if stick_to_bottom:
+            self.archive_box.see("end")
         self.archive_box.configure(state="disabled")
 
     def _set_status(self, text: str):
@@ -3591,26 +3673,34 @@ class ScdlApp(ctk.CTk):
             self._refresh_scdl_state()
             return
 
-        if not self.use_archive.get():
-            messagebox.showerror("Archive disabled", "Enable an archive file before scanning it.")
-            return
-
         self._save_current_values()
 
-        archive = os.path.expanduser(self.archive_entry.get().strip())
-        if not archive:
-            messagebox.showerror("Missing archive path", "Please enter a path for the archive file.")
-            return
+        audio_dir = audio_base_path(self._current_profile())
+        tagged_mp3s, audio_count, dir_count, tag_error = scan_audio_tags(audio_dir)
 
-        track_ids = read_archive_track_ids(archive)
+        archive = os.path.expanduser(self.archive_entry.get().strip()) if self.use_archive.get() else ""
+        using_archive = bool(archive)
+        if using_archive:
+            track_ids = read_archive_track_ids(archive)
+        else:
+            track_ids = list(tagged_mp3s.keys())
+
         if not track_ids:
             self.view_switch.set("Archive Check")
             self._switch_output_view("Archive Check")
-            self._set_archive_text("No SoundCloud track ids were found in the archive.\n")
+            if using_archive:
+                message = "No SoundCloud track ids were found in the archive.\n"
+            elif tag_error:
+                message = f"Audio tag scan failed: {tag_error}\n"
+            else:
+                message = (
+                    "No SoundCloud-tagged audio files were found to check. Enable an archive file, "
+                    "or download tracks through this app first so they get tagged.\n"
+                )
+            self._set_archive_text(message)
             return
 
         token = ""
-        audio_dir = audio_base_path(self._current_profile())
         self.view_switch.set("Archive Check")
         self._switch_output_view("Archive Check")
         self.archive_scan_btn.configure(state="disabled")
@@ -3618,19 +3708,14 @@ class ScdlApp(ctk.CTk):
         self.stop_btn.configure(state="normal")
         self._archive_scan_stopping = False
         self._set_status("Scanning archive…")
+        source_desc = "archived SoundCloud track(s)" if using_archive else "locally tagged SoundCloud track(s)"
         self._set_archive_text(
-            f"Scanning {len(track_ids)} archived SoundCloud track(s)…\n"
+            f"Scanning {len(track_ids)} {source_desc}…\n"
             f"Scanning tagged audio files in {audio_dir}\n"
             "Checking public SoundCloud availability without the auth token.\n"
             f"Checking up to {min(8, max(1, len(track_ids)))} tracks at a time.\n"
             "Deleted, private, or otherwise inaccessible tracks will appear below.\n\n"
         )
-        changed, post_error = postprocess_downloaded_mp3s(self._current_profile())
-        if post_error:
-            self._append_archive_text(f"Audio tag/rename skipped: {post_error}\n")
-        elif changed:
-            self._append_archive_text(f"Tagged and renamed {len(changed)} existing audio file(s).\n")
-        tagged_mp3s, audio_count, dir_count, tag_error = scan_audio_tags(audio_dir)
         if tag_error:
             self._append_archive_text(f"Audio tag scan skipped: {tag_error}\n\n")
         elif audio_count == 0:
