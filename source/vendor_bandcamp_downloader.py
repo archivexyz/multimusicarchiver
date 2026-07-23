@@ -19,6 +19,10 @@ Local modifications from upstream (marked inline with "Local modification"):
     (very large albums are served chunked without them); when the size is
     unknown, downloaded zips are structure-validated before being moved into
     place so a truncated transfer can't pass as complete.
+  * Permanently unavailable items (HTTP 403, no downloads, format not
+    offered) additionally log a machine-readable 'Item permanently
+    unavailable: [id] artist - title' line via _mark_unavailable(), which the
+    GUI wrapper records as a 'bandcamp-skip' archive entry.
 
 bandcamp-downloader is distributed under the MIT License:
 
@@ -549,6 +553,16 @@ def download_and_log_album(_album : dict):
     CONFIG['TQDM'].update()
     time.sleep(CONFIG['POST_DOWNLOAD_WAIT'])
 
+# Local modification: mark an item that can never be downloaded (removed
+# download, 403, format not offered) and emit a machine-readable line the
+# GUI wrapper parses to record the item as 'bandcamp-skip' in its archive --
+# otherwise its collection-total accounting can never reconcile and every
+# sync walks the entire collection.
+def _mark_unavailable(_album : dict) -> None:
+    _album['download_status'] = 'Unavailable'
+    _log_line('Item permanently unavailable: [{}] {} - {}'.format(
+        _album.get('item_id', ''), _album.get('band_name', ''), _album.get('item_title', '')))
+
 # Download the file for the given bandcamp album. Sets the key 'extension'
 # to the file extension for this item, and the key 'downloaded' to whether
 # a file was successfully downloaded.
@@ -569,12 +583,12 @@ def download_album(_album : dict):
 
     if not 'downloads' in download_item:
         CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] has no downloads available.'.format(title, album_url))
-        _album['download_status'] = 'Unavailable'
+        _mark_unavailable(_album)
         return
 
     if not CONFIG['FORMAT'] in download_item['downloads']:
         CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] does not have a download for format [{}].'.format(title, album_url, CONFIG['FORMAT']))
-        _album['download_status'] = 'Unavailable'
+        _mark_unavailable(_album)
         return
 
     download = download_item['downloads'][CONFIG['FORMAT']]
@@ -678,7 +692,7 @@ def download_file(_url : str, _album : dict, _attempt : int = 1) -> bool:
         # Basically, this response means the download is never going to work.
         if e.__class__.__name__ == "HTTPError" and e.response.status_code == 403:
             CONFIG['TQDM'].write('WARN: HTTP 403 when trying to download the file at [{}] to location [{}].\nBandcamp may have removed this download and you may need to download it manually from the website.'.format(_url, _album['file_path'] + _album['extension']))
-            _album['download_status'] = 'Unavailable'
+            _mark_unavailable(_album)
         elif _attempt < CONFIG['MAX_URL_ATTEMPTS']:
             if CONFIG['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the file at [{}] to location [{}]. Trying again...'.format(_attempt, _url, _album['file_path'] + _album['extension']))
             time.sleep(CONFIG['URL_RETRY_WAIT'])

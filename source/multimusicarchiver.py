@@ -1256,6 +1256,8 @@ def process_bandcamp_downloads(
 
 
 def read_bandcamp_archive_ids(archive_path: str) -> set[str]:
+    """All item ids the archive accounts for: downloaded albums ('bandcamp'
+    lines) plus permanently unavailable ones recorded as 'bandcamp-skip'."""
     ids: set[str] = set()
     try:
         with open(archive_path, encoding="utf-8") as archive:
@@ -1264,7 +1266,23 @@ def read_bandcamp_archive_ids(archive_path: str) -> set[str]:
                 if not entry:
                     continue
                 parts = entry.split(maxsplit=2)
-                if len(parts) >= 2 and parts[0].lower() == "bandcamp":
+                if len(parts) >= 2 and parts[0].lower() in ("bandcamp", "bandcamp-skip"):
+                    ids.add(parts[1])
+    except FileNotFoundError:
+        pass
+    return ids
+
+
+def read_bandcamp_skip_ids(archive_path: str) -> set[str]:
+    """Ids of items recorded as permanently unavailable ('bandcamp-skip'
+    lines): counted as accounted-for by the sync-boundary logic and never
+    self-heal re-downloaded. Delete the line from the archive to retry one."""
+    ids: set[str] = set()
+    try:
+        with open(archive_path, encoding="utf-8") as archive:
+            for line in archive:
+                parts = line.strip().split(maxsplit=2)
+                if len(parts) >= 2 and parts[0].lower() == "bandcamp-skip":
                     ids.add(parts[1])
     except FileNotFoundError:
         pass
@@ -1273,19 +1291,10 @@ def read_bandcamp_archive_ids(archive_path: str) -> set[str]:
 
 BANDCAMP_ARCHIVE_HEADER_RE = re.compile(r"^#\s*total\s*:?\s*(\d+)", re.IGNORECASE)
 BANDCAMP_FOUND_ITEMS_RE = re.compile(r"Found \[(\d+)\] downloadable items in")
-
-
-def read_bandcamp_archive_total(archive_path: str) -> int | None:
-    """Reads the '# total N' header line written by append_bandcamp_archive.
-    Returns None if the archive has no header (e.g. it's empty, or predates
-    this feature) -- callers should treat that as 'unknown, don't validate'."""
-    try:
-        with open(archive_path, encoding="utf-8") as archive:
-            first_line = archive.readline()
-    except FileNotFoundError:
-        return None
-    match = BANDCAMP_ARCHIVE_HEADER_RE.match(first_line.strip())
-    return int(match.group(1)) if match else None
+# Emitted by the vendored downloader (local modification) for items whose
+# download can never succeed: HTTP 403, no downloads offered, or no download
+# in the requested format.
+BANDCAMP_UNAVAILABLE_RE = re.compile(r"Item permanently unavailable: \[(?P<id>\d+)\]\s*(?P<label>.*)")
 
 
 def bandcamp_archive_ids_for_profile(profile: dict) -> set[str]:
@@ -1297,16 +1306,24 @@ def bandcamp_archive_ids_for_profile(profile: dict) -> set[str]:
     return read_bandcamp_archive_ids(path)
 
 
-def bandcamp_archive_total_for_profile(profile: dict) -> int | None:
+def bandcamp_skip_ids_for_profile(profile: dict) -> set[str]:
     if not profile.get("bandcamp_use_archive"):
-        return None
+        return set()
     path = os.path.expanduser(profile.get("bandcamp_archive_path", "").strip())
     if not path:
-        return None
-    return read_bandcamp_archive_total(path)
+        return set()
+    return read_bandcamp_skip_ids(path)
 
 
-def append_bandcamp_archive(archive_path: str, confirmed: list[tuple[str, str]]) -> int:
+def append_bandcamp_archive(
+    archive_path: str,
+    confirmed: list[tuple[str, str]],
+    entry_prefix: str = "bandcamp",
+) -> int:
+    """Appends (item_id, label) entries not already accounted for. With the
+    default prefix these are downloaded albums; entry_prefix='bandcamp-skip'
+    records permanently unavailable items instead. The '# total N' header is
+    informational only -- the sync logic counts actual entry lines."""
     if not confirmed:
         return 0
     existing_ids = read_bandcamp_archive_ids(archive_path)
@@ -1341,7 +1358,7 @@ def append_bandcamp_archive(archive_path: str, confirmed: list[tuple[str, str]])
         f.write(f"# total {new_total}\n")
         f.writelines(body_lines)
         for item_id, label in new_entries:
-            f.write(f"bandcamp {item_id} {label}\n")
+            f.write(f"{entry_prefix} {item_id} {label}\n")
     os.replace(temp_path, archive_path)
     return len(new_entries)
 
@@ -1371,12 +1388,13 @@ def run_bandcamp_download(
     archive_ids: set[str],
     archive_total: int | None,
     extract: bool = True,
+    skip_ids: set[str] | None = None,
     on_line=None,
     on_start=None,
     on_archive_check=None,
     on_archive_continue=None,
     on_archive_reprocess=None,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[tuple[str, str]]]:
     """Runs bandcamp-downloader, streaming its output to `on_line`. If
     `archive_ids` is non-empty (an incremental sync against an existing
     archive), watches for the tool starting a fresh download of an album
@@ -1396,20 +1414,34 @@ def run_bandcamp_download(
     totals aren't available to check at all) do we stop early.
 
     Additionally, an archived item is only ever treated as the stop boundary
-    if its output actually exists on disk (extracted folder / sorted single).
-    An archived item with *no* backing output is a self-heal re-download of
-    lost files: killing it here would delete the partial file afterwards and
-    repeat forever, so it's always left to finish instead.
+    if its output actually exists on disk (extracted folder / sorted single)
+    or it is recorded as permanently unavailable (`skip_ids`, from
+    'bandcamp-skip' archive lines). An archived item with *no* backing output
+    is a self-heal re-download of lost files: killing it here would delete
+    the partial file afterwards and repeat forever, so it's always left to
+    finish instead.
 
-    Returns (returncode, stopped_early)."""
+    Items the tool reports as permanently unavailable (HTTP 403, no download
+    offered) are collected and counted toward the accounting above -- they
+    can never enter the archive as downloads, so without this every sync
+    would conclude the collection is not fully covered and walk it end to
+    end. Each new item is counted once by id (retries re-log the same save
+    line).
+
+    Returns (returncode, stopped_early, unavailable) where `unavailable` is
+    a list of (item_id, label) the caller should record as 'bandcamp-skip'
+    archive entries."""
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         encoding="utf-8", errors="replace", env=child_process_env(),
     )
     if on_start:
         on_start(process)
+    skip_ids = skip_ids or set()
     stopped_early = False
-    session_new_count = 0
+    session_new_ids: set[str] = set()
+    session_unavailable_ids: set[str] = set()
+    unavailable: list[tuple[str, str]] = []
     found_total: int | None = None
     assert process.stdout is not None
     for line in process.stdout:
@@ -1419,6 +1451,13 @@ def run_bandcamp_download(
             match = BANDCAMP_FOUND_ITEMS_RE.search(line)
             if match:
                 found_total = int(match.group(1))
+        unavailable_match = BANDCAMP_UNAVAILABLE_RE.search(line)
+        if unavailable_match:
+            item_id = unavailable_match.group("id")
+            if item_id and item_id not in archive_ids and item_id not in session_unavailable_ids:
+                session_unavailable_ids.add(item_id)
+                unavailable.append((item_id, unavailable_match.group("label").strip() or "unknown"))
+            continue
         if archive_ids and not stopped_early:
             saved = bandcamp_item_from_save_line(line)
             if saved:
@@ -1427,9 +1466,9 @@ def run_bandcamp_download(
                 if on_archive_check:
                     on_archive_check(item_id, in_archive)
                 if not in_archive:
-                    session_new_count += 1
+                    session_new_ids.add(item_id)
                     continue
-                if not bandcamp_item_output_backed(save_path, extract):
+                if item_id not in skip_ids and not bandcamp_item_output_backed(save_path, extract):
                     # Archived but its files are gone locally: this fresh
                     # download is the self-heal. Killing it would strand the
                     # album forever (partial file deleted, archive entry
@@ -1438,15 +1477,16 @@ def run_bandcamp_download(
                         on_archive_reprocess(item_id)
                     continue
                 if archive_total is not None and found_total is not None:
-                    accounted_for = session_new_count + archive_total
+                    session_count = len(session_new_ids | session_unavailable_ids)
+                    accounted_for = session_count + archive_total
                     if accounted_for < found_total:
                         if on_archive_continue:
-                            on_archive_continue(item_id, session_new_count, archive_total, found_total)
+                            on_archive_continue(item_id, session_count, archive_total, found_total)
                         continue
                 stopped_early = True
                 terminate_process_tree(process)
     process.wait()
-    return process.returncode, stopped_early
+    return process.returncode, stopped_early, unavailable
 
 
 def redact_cmd(cmd: list[str]) -> list[str]:
@@ -1814,7 +1854,10 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
     if service == "bandcamp":
         cmd = build_bandcamp_cmd(profile)
         archive_ids = bandcamp_archive_ids_for_profile(profile)
-        archive_total = bandcamp_archive_total_for_profile(profile)
+        skip_ids = bandcamp_skip_ids_for_profile(profile)
+        # Derived from actual entry lines (including bandcamp-skip), not the
+        # informational '# total' header, so manual edits are honored.
+        archive_total = len(archive_ids) if archive_ids else None
         if archive_ids:
             print(
                 f"Archive has {len(archive_ids)} album(s) on record; syncing sequentially and "
@@ -1846,8 +1889,8 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
                 file=out, flush=True,
             )
 
-        rc, stopped_early = run_bandcamp_download(
-            cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")),
+        rc, stopped_early, unavailable = run_bandcamp_download(
+            cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")), skip_ids,
             on_line=on_line, on_archive_check=on_archive_check,
             on_archive_continue=on_archive_continue, on_archive_reprocess=on_archive_reprocess,
         )
@@ -1857,6 +1900,18 @@ def run_scheduled_profile(profile: dict, out, log_stream=None) -> int:
         if profile.get("bandcamp_dry_run"):
             print("Dry run: skipped zip post-processing and archive updates.", file=out, flush=True)
             return rc
+
+        if profile.get("bandcamp_use_archive") and unavailable:
+            archive_path = os.path.expanduser(profile.get("bandcamp_archive_path", "").strip())
+            if archive_path:
+                added_skips = append_bandcamp_archive(archive_path, unavailable, entry_prefix="bandcamp-skip")
+                if added_skips:
+                    print(
+                        f"Recorded {added_skips} permanently unavailable album(s) as 'bandcamp-skip' "
+                        "archive entries so future syncs account for them; delete those lines from "
+                        "the archive file to retry them.",
+                        file=out, flush=True,
+                    )
 
         confirmed, extracted_count, removed, error = process_bandcamp_downloads(
             bandcamp_base_path(profile), bool(profile.get("bandcamp_extract")), archive_ids
@@ -3899,7 +3954,11 @@ class ScdlApp(ctk.CTk):
 
                 # ── Bandcamp ──
                 archive_ids = bandcamp_archive_ids_for_profile(profile)
-                archive_total = bandcamp_archive_total_for_profile(profile)
+                skip_ids = bandcamp_skip_ids_for_profile(profile)
+                # Derived from actual entry lines (including bandcamp-skip),
+                # not the informational '# total' header, so manual edits are
+                # honored.
+                archive_total = len(archive_ids) if archive_ids else None
                 if archive_ids:
                     self.after(
                         0,
@@ -3944,8 +4003,8 @@ class ScdlApp(ctk.CTk):
                         ),
                     )
 
-                returncode, stopped_early = run_bandcamp_download(
-                    cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")),
+                returncode, stopped_early, unavailable = run_bandcamp_download(
+                    cmd, archive_ids, archive_total, bool(profile.get("bandcamp_extract")), skip_ids,
                     on_line=on_line, on_start=on_start,
                     on_archive_check=on_archive_check, on_archive_continue=on_archive_continue,
                     on_archive_reprocess=on_archive_reprocess,
@@ -3965,6 +4024,22 @@ class ScdlApp(ctk.CTk):
                     # no zip deletion, no archive updates.
                     self.after(0, lambda: self._log("Dry run: skipped zip post-processing and archive updates.\n"))
                 else:
+                    if profile.get("bandcamp_use_archive") and unavailable:
+                        skip_archive_path = os.path.expanduser(profile.get("bandcamp_archive_path", "").strip())
+                        if skip_archive_path:
+                            added_skips = append_bandcamp_archive(
+                                skip_archive_path, unavailable, entry_prefix="bandcamp-skip"
+                            )
+                            if added_skips:
+                                self.after(
+                                    0,
+                                    lambda count=added_skips: self._log(
+                                        f"Recorded {count} permanently unavailable album(s) as "
+                                        "'bandcamp-skip' archive entries so future syncs account for "
+                                        "them; delete those lines from the archive file to retry them.\n",
+                                        "warn",
+                                    ),
+                                )
                     confirmed, extracted_count, removed, error = process_bandcamp_downloads(
                         bandcamp_base_path(profile), bool(profile.get("bandcamp_extract")), archive_ids
                     )
