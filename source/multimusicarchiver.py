@@ -1276,13 +1276,17 @@ def zip_probe(path: str) -> str:
         return "unknown"
 
 
-# Requires 7+ digits: real Bandcamp item ids have them, while shorter bracket
-# prefixes are common human naming conventions the destructive post-scan must
-# never claim as its own -- "[1997] OK Computer.zip", "[01] Intro.mp3", and
-# critically every YYMMDD date name ("[210415] Artist - Live Set.zip"), which
-# a 6-digit minimum would still match. A hypothetical ancient item with a
+# Requires 6+ digits: shorter bracket prefixes are common human naming
+# conventions the destructive post-scan must never claim as its own --
+# "[1997] OK Computer.zip", "[01] Intro.mp3". A 6-digit floor still overlaps
+# YYMMDD date names ("[210415] Artist - Live Set.zip"), the one ambiguity a
+# digit count alone can't resolve since real ids can be exactly 6 digits too
+# (Bandcamp's early catalog); a false claim there still requires this exact
+# number to also be one of *this app's own* archived ids for that *same*
+# artist folder, which the id-match and artist-layout checks below make
+# vanishingly unlikely in practice. A hypothetical ancient item with an even
 # shorter id merely goes unprocessed.
-BANDCAMP_ITEM_NAME_RE = re.compile(r"^\[(?P<id>\d{7,})\]\s*(?P<label>.+)$")
+BANDCAMP_ITEM_NAME_RE = re.compile(r"^\[(?P<id>\d{6,})\]\s*(?P<label>.+)$")
 BANDCAMP_SAVE_LOG_RE = re.compile(r"Album being saved to \[(?P<path>.+)\]")
 BANDCAMP_DIRECT_AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".aiff", ".wav", ".ogg"}
 # Superset of the direct-download extensions: what may appear *inside* an
@@ -1376,6 +1380,18 @@ def unique_path(path: str) -> str:
     # Falling back to the original path would hand the caller an *existing*
     # file to overwrite; a hard error is the only safe outcome.
     raise FileExistsError(f"No collision-free name available for {path}")
+
+
+def bandcamp_album_folder_name(label: str) -> str:
+    """The album label flows straight from Bandcamp metadata into a bare
+    folder name with no extension to shield it, so a title ending in a
+    Windows-illegal trailing dot/space (e.g. an ellipsis) needs the same
+    sanitizing zip member names already get in extract_zip_safely.
+    Otherwise os.makedirs() silently drops the trailing characters on disk
+    while our own path string still has them, so the very next lookup for
+    that same folder -- 'does it already exist', 'extract into it' -- misses
+    the folder it (or a prior run) just created."""
+    return sanitize_windows_filename(label)
 
 
 def path_within_base(base: str, path: str) -> bool:
@@ -1478,7 +1494,7 @@ def bandcamp_zip_already_extracted(root: str, label: str) -> bool:
     album whose audio was lost would count as 'backed', its self-heal
     re-download would be deleted on arrival, and the loss would repeat on
     every future sync."""
-    target_dir = os.path.join(root, label)
+    target_dir = os.path.join(root, bandcamp_album_folder_name(label))
     if not os.path.isdir(target_dir):
         return False
     try:
@@ -1572,18 +1588,35 @@ def bandcamp_item_conforms_to_layout(base: str, root: str, label: str) -> bool:
     app's --filename-format ('{artist}/[{item_id}] {artist} - {title}')
     writes downloads: directly inside a first-level artist folder whose name
     the label repeats. This is one of three independent gates the post-run
-    scan requires before touching a file -- the others are the 7+ digit
+    scan requires before touching a file -- the others are the 6+ digit
     bracket id and proof the id was actually downloaded by this app (archive
     or pending-claim record) -- because the scan deletes/extracts/moves what
     it claims, and a pre-existing library organized as Base/Artist/ can hold
     foreign files whose names alone look like ours. Files the downloader
     wrote always conform by construction, wherever the user pointed
-    'Save to'."""
+    'Save to'.
+
+    The comparison against the on-disk artist folder tolerates two
+    Windows-only mismatches rather than requiring an exact match: (1)
+    Bandcamp reports inconsistent capitalization of the same artist across
+    different releases, and a folder name is case-insensitive on Windows
+    regardless of what any single zip's label says; (2) Windows silently
+    drops trailing dots/spaces off a folder name when it's created (e.g. an
+    artist called 'V.A.' lands on disk as 'V.A'), so the label's own
+    un-mangled artist prefix can carry extra '.'/' ' characters before its
+    ' - ' separator that the real folder name never had."""
     parent = os.path.normcase(os.path.abspath(os.path.dirname(root)))
     if parent != os.path.normcase(os.path.abspath(base)):
         return False
     artist = os.path.basename(os.path.normpath(root))
-    return label == artist or label.startswith(artist + " - ")
+    artist_norm = os.path.normcase(artist)
+    label_norm = os.path.normcase(label)
+    if label_norm == artist_norm:
+        return True
+    if not label_norm.startswith(artist_norm):
+        return False
+    rest = label[len(artist):].lstrip(" .")
+    return rest.startswith("- ")
 
 
 def process_bandcamp_downloads(
@@ -1595,7 +1628,7 @@ def process_bandcamp_downloads(
 ) -> tuple[list[tuple[str, str]], int, list[str], list[str], str | None]:
     """Scan a Bandcamp download folder after a run. Only files this app
     downloaded are ever touched, and ownership requires all three of: the
-    '[item_id] ' filename prefix our --filename-format produces (7+ digit
+    '[item_id] ' filename prefix our --filename-format produces (6+ digit
     id), the matching on-disk layout (bandcamp_item_conforms_to_layout),
     and proof the id was downloaded by this app -- membership in
     `claim_ids` (ids from the archive, from this run's 'Album being saved
@@ -1708,12 +1741,29 @@ def process_bandcamp_downloads(
                     continue
                 if extract:
                     try:
-                        extract_zip_safely(path, os.path.join(root, parsed[1]), containment_base=base)
-                        os.remove(path)
+                        extract_zip_safely(
+                            path, os.path.join(root, bandcamp_album_folder_name(parsed[1])), containment_base=base
+                        )
                     except Exception as err:
                         errors.append(f"{filename}: {err}")
                         continue
                     extracted_count += 1
+                    try:
+                        os.remove(path)
+                    except OSError as err:
+                        # Extraction genuinely succeeded -- the album must
+                        # still be archived even though the now-redundant zip
+                        # is stuck (a transient lock from AV/indexing on a
+                        # file this fresh is common). Leaving it unarchived
+                        # would mean re-downloading and re-extracting it
+                        # (duplicating every track as 'Track (1).mp3') on
+                        # every future sync instead of just retrying this one
+                        # delete, which the next sync's already-extracted
+                        # check will do once this id is in the archive.
+                        errors.append(
+                            f"{filename}: extracted OK but couldn't remove the now-redundant zip ({err}); "
+                            "it will be retried on the next sync."
+                        )
                 confirmed.append(parsed)
             elif ext in BANDCAMP_DIRECT_AUDIO_EXTS:
                 # Bandcamp singles/tracks download as a bare audio file

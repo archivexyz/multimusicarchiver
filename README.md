@@ -143,9 +143,14 @@ shown relative to that folder; `<id>` is a real SoundCloud/Bandcamp ID.
 
 A file is only ever eligible if **all** of these hold:
 
-- Its name carries a bracketed ID of **7 or more digits** — the format this app writes. This
-  deliberately excludes human naming conventions like `[1997] OK Computer.zip`, `[01] Intro.mp3`,
-  and date-style names like `[210415] Artist - Live Set.zip`, none of which can ever be claimed.
+- Its name carries a bracketed ID of **7 or more digits for SoundCloud, 6 or more for Bandcamp**
+  — the format this app writes. This deliberately excludes human naming conventions like
+  `[1997] OK Computer.zip` and `[01] Intro.mp3`, which can never be claimed. Bandcamp's floor is a
+  digit lower than SoundCloud's to admit early, low-numbered Bandcamp purchases; the one remaining
+  ambiguity is a `YYMMDD` date-style name (`[210415] Artist - Live Set.zip`), which is also 6
+  digits. A Bandcamp file like that could only ever be claimed if that exact number also happened
+  to be one of this app's own archived IDs for that same artist — the ID-match and artist-folder
+  checks below make that vanishingly unlikely in practice.
 - **Bandcamp:** it also sits in the exact `<Artist>/` layout the downloader writes, *and* its ID is
   one this app can prove it downloaded — present in your archive file, seen in this run's download
   log, or recorded in the pending-claims file from a run that was interrupted.
