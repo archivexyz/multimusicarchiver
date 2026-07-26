@@ -30,6 +30,14 @@ Local modifications from upstream (marked inline with "Local modification"):
     failing zip validation, retried, and left unrecorded -- which made the
     item's collection-total accounting never reconcile and every sync re-walk
     the whole collection retrying it.
+  * get_items_for_user() calls sys.exit() where upstream calls the bare
+    exit() builtin. exit()/quit() are injected into builtins by the `site`
+    module for interactive-shell convenience; a normal `python3 script.py`
+    run has them (site runs by default), but this module is also executed
+    inside the frozen app's own embedded interpreter (run_embedded_bandcamp),
+    which does not get the same site initialization -- there exit() raised
+    NameError instead of exiting, turning a clean "bad username" error into
+    an unhandled crash.
 
 bandcamp-downloader is distributed under the MIT License:
 
@@ -389,12 +397,12 @@ def get_items_for_user(_user : str, _include_hidden : bool) -> dict:
     data = pagedata_with_retry(user_url)
     if not data:
         print('ERROR: No data found at user url [{}]'.format(user_url))
-        exit(2)
+        sys.exit(2)
     if 'collection_count' not in data:
         print('ERROR: No collection info for user {}.\nPlease double check that your given username is correct.\nIt should be given exactly as it appears at the end of your bandcamp user url.\nFor example: bandcamp.com/user_name'.format(
             _user
         ))
-        exit(2)
+        sys.exit(2)
     user_id = data['fan_data']['fan_id']
 
     items = data['item_cache']['collection']
