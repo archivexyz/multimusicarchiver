@@ -1597,20 +1597,27 @@ def bandcamp_item_conforms_to_layout(base: str, root: str, label: str) -> bool:
     'Save to'.
 
     The comparison against the on-disk artist folder tolerates two
-    Windows-only mismatches rather than requiring an exact match: (1)
-    Bandcamp reports inconsistent capitalization of the same artist across
-    different releases, and a folder name is case-insensitive on Windows
-    regardless of what any single zip's label says; (2) Windows silently
-    drops trailing dots/spaces off a folder name when it's created (e.g. an
-    artist called 'V.A.' lands on disk as 'V.A'), so the label's own
-    un-mangled artist prefix can carry extra '.'/' ' characters before its
-    ' - ' separator that the real folder name never had."""
+    mismatches rather than requiring an exact match: (1) Bandcamp reports
+    inconsistent capitalization of the same artist across different releases
+    -- e.g. one album's zip embeds 'Arcade Trauma' while another embeds
+    'arcade trauma' -- so the folder name (created once, from whichever
+    album made it first) and a later zip's label routinely disagree on case.
+    This is a real-world Bandcamp data inconsistency, not a Windows-specific
+    filesystem quirk, so the comparison is case-insensitive on every platform
+    (os.path.normcase is the wrong tool for this: it only folds case on
+    Windows and is a no-op on macOS/Linux, which silently made this
+    intolerant on those platforms even though the docstring here used to
+    claim otherwise). (2) Windows silently drops trailing dots/spaces off a
+    folder name when it's created (e.g. an artist called 'V.A.' lands on
+    disk as 'V.A'), so the label's own un-mangled artist prefix can carry
+    extra '.'/' ' characters before its ' - ' separator that the real folder
+    name never had."""
     parent = os.path.normcase(os.path.abspath(os.path.dirname(root)))
     if parent != os.path.normcase(os.path.abspath(base)):
         return False
     artist = os.path.basename(os.path.normpath(root))
-    artist_norm = os.path.normcase(artist)
-    label_norm = os.path.normcase(label)
+    artist_norm = artist.lower()
+    label_norm = label.lower()
     if label_norm == artist_norm:
         return True
     if not label_norm.startswith(artist_norm):
@@ -1662,6 +1669,13 @@ def process_bandcamp_downloads(
     the whole scan -- one bad album must never block every other album from
     being processed.
 
+    With extraction on, every zip this app is certain it owns (its id is in
+    `claim_ids`) that does NOT end up extracted is recorded in the returned
+    error summary -- a layout mismatch, or contents zip_probe couldn't
+    verify -- so a stuck extraction is never silent. A zip with no ownership
+    proof at all is still left alone without comment, since that's the
+    ordinary shape of an unrelated pre-existing library file.
+
     Returns (confirmed, extracted_count, removed, quarantined, error_summary)."""
     archive_ids = archive_ids or set()
     archive_labels = archive_labels or {}
@@ -1696,12 +1710,28 @@ def process_bandcamp_downloads(
                 continue
             if ext == ".zip":
                 parsed = parse_bandcamp_item_from_stem(stem)
-                if (
-                    not parsed
-                    or parsed[0] not in claim_ids
-                    or not bandcamp_item_conforms_to_layout(base, root, parsed[1])
-                ):
-                    # No proof this app downloaded it -- leave it alone.
+                if not parsed or parsed[0] not in claim_ids:
+                    # No proof this app downloaded it (unparseable name, or an
+                    # id we have no record of) -- silently leave it alone.
+                    # Reporting here would be noise: this is the expected,
+                    # common shape of an unrelated pre-existing library file.
+                    continue
+                if not bandcamp_item_conforms_to_layout(base, root, parsed[1]):
+                    # Unlike the check above, this id IS one we know we
+                    # downloaded (it's in claim_ids) -- so a layout mismatch
+                    # here is not "probably a foreign file", it's "we can't
+                    # process something we're sure is ours" (e.g. an artist
+                    # name whose capitalization differs between this album's
+                    # zip and the folder bandcamp_item_conforms_to_layout
+                    # expects). The file is still left untouched, but with
+                    # extraction on this would otherwise be a zip that
+                    # silently never gets unzipped -- report it instead.
+                    if extract:
+                        errors.append(
+                            f"{filename}: id {parsed[0]} is archived/claimed by this app, but its "
+                            f"location doesn't match the expected 'Artist/[id] Artist - Title.zip' "
+                            f"layout under '{os.path.basename(root)}/' -- left as-is, not extracted."
+                        )
                     continue
                 if parsed[0] in archive_ids:
                     if not extract:
@@ -1724,7 +1754,15 @@ def process_bandcamp_downloads(
                 if validity == "unknown":
                     # Can't prove anything about it (encrypted members,
                     # unsupported compression, I/O error) -- it may well be
-                    # a good archive, so leave it exactly as it is.
+                    # a good archive, so leave it exactly as it is. This zip
+                    # is fully owned (claim + layout already confirmed above),
+                    # so with extraction on it would otherwise silently never
+                    # get unzipped -- report it instead.
+                    if extract:
+                        errors.append(
+                            f"{filename}: could not verify zip contents (encrypted, unsupported "
+                            "compression, or unreadable) -- left as-is, not extracted."
+                        )
                     continue
                 if validity == "corrupt":
                     # Structurally broken and owned by this app (claim +
