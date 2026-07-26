@@ -149,8 +149,7 @@ A file is only ever eligible if **all** of these hold:
   digit lower than SoundCloud's to admit early, low-numbered Bandcamp purchases; the one remaining
   ambiguity is a `YYMMDD` date-style name (`[210415] Artist - Live Set.zip`), which is also 6
   digits. A Bandcamp file like that could only ever be claimed if that exact number also happened
-  to be one of this app's own archived IDs for that same artist — the ID-match and artist-folder
-  checks below make that vanishingly unlikely in practice.
+  to be one of this app's own archived IDs for that same artist which is extremely unlikely
 - **Bandcamp:** it also sits in the exact `<Artist>/` layout the downloader writes, *and* its ID is
   one this app can prove it downloaded — present in your archive file, seen in this run's download
   log, or recorded in the pending-claims file from a run that was interrupted.
