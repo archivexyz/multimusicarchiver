@@ -3064,6 +3064,7 @@ class TimePicker(ctk.CTkFrame):
         self._hovered_value = None
         self._rows = {}
         self._outside_click_binding = None
+        self._suppress_next_toggle = False
         self._column_count = 3 if len(values) > 12 else 1
 
         self.button = ctk.CTkButton(self, text=self._value, width=width, command=self._toggle_dropdown)
@@ -3101,6 +3102,19 @@ class TimePicker(ctk.CTkFrame):
             # holds its own grab until dismissed, so this (fired on ButtonRelease)
             # would otherwise re-open the just-closed menu. See _open_native_menu.
             return
+        if self._suppress_next_toggle:
+            # This is the ButtonRelease-1 half of the exact same click whose
+            # ButtonPress-1 just opened the dropdown via _open_for_drag below
+            # (command fires on release). Without this guard, a plain click
+            # -- press then release without dragging -- opens the dropdown
+            # and immediately closes it again in the same gesture, which is
+            # indistinguishable from it never opening at all; only a
+            # press-and-hold-then-drag (which releases over a row instead of
+            # the button) escaped this. Consume this one release instead of
+            # treating it as a fresh toggle; a later, separate click on the
+            # button still closes it via the branch below.
+            self._suppress_next_toggle = False
+            return
         if self._dropdown is not None and self._dropdown.winfo_exists():
             self._close_dropdown()
         else:
@@ -3112,7 +3126,9 @@ class TimePicker(ctk.CTkFrame):
         if platform.system() == "Darwin":
             self._open_native_menu()
         else:
+            already_open = self._dropdown is not None and self._dropdown.winfo_exists()
             self._open_dropdown()
+            self._suppress_next_toggle = not already_open
 
     def _open_native_menu(self):
         """A borderless custom Toplevel (what _open_dropdown below uses) is
